@@ -1,0 +1,632 @@
+if(length(c("dplyr", "readr", "tidyr")[c("dplyr", "readr", "tidyr") %in% installed.packages()[,"Package"]])<3){install.packages("dplyr", "readr", "tidyr")}
+
+#install.packages("dplyr","readr","tidyr")
+library(dplyr)
+library(readr)
+library(tidyr)
+
+#Skapar fillista dataset
+# Vi läster först in alla datset i in-mappen till "fillista", och från den listan namnet på alla 
+# relaterade
+# rubriker, ini-filer, headers-filer och pivoteringsviller till "fillista_rensad". 
+
+fillista<-list.files("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_HALT")
+fillista_rensad<-gsub("_[0-9]{8}.csv","",fillista)
+fillista_rensad<-gsub(".csv","",fillista_rensad)
+
+TIMEVAL_VECTOR<-c()
+
+#Vi startar vår for-loop:
+
+for(i in seq_along(fillista)){
+
+#Läser in datafiler
+
+df2 <- read_delim(paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_HALT\\",fillista[i]), 
+    delim = ";", escape_double = FALSE, locale = locale(encoding = "ISO-8859-1"), 
+    trim_ws = TRUE)
+
+
+#Läser in kontrollfiler
+
+full_control <- read_delim(paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob/kontrollfiler HALT\\",fillista_rensad[i],".csv"), 
+    delim = ";", escape_double = FALSE, col_names = FALSE, 
+    locale = locale(encoding = "windows-1252"), 
+    trim_ws = TRUE)
+
+names(full_control)<-c("first","second","third", "fourth", "fifth", "sixth","seventh", "eighth", "ninth" )
+
+#Noterar tidsvariabel
+    
+tidsvariabel<-full_control%>%filter(first=="variablename")%>%select(third)
+tidsvariabel<-tidsvariabel$third
+tidsvariabel<-df2%>%pull(tidsvariabel)
+tidsvariabel<-tidsvariabel[!is.na(tidsvariabel)]
+
+#Lägger till obligatoriska fält. 
+
+#Lägger till REFPERIOD i KONTROLLFILEN med värden från datafil
+    
+full_control<-full_control%>%
+    mutate(second=ifelse(first=="LAST-UPDATED", as.character(format(Sys.time(),"%Y%m%d %H:%M")),ifelse(first=="REFPERIOD",paste0(min(tidsvariabel)," - ", max(tidsvariabel)),second)))
+    
+    TIMEVAL<-ifelse(sum(full_control$first=="TIMEVAL" & !is.na(full_control$third))>0," !T","")
+    TIMEVAL_VECTOR<-c(TIMEVAL_VECTOR,TIMEVAL)
+
+   
+
+#Läser in rubrik och pivoteringskolumn från kontrollfil
+
+tabellrubrik<-full_control%>%filter(first=="TITLE")%>%select(second)
+
+stub<-full_control%>%filter(first=="STUB")%>%select(second)
+stub<-as.matrix(stub)[,]
+
+headings<-full_control%>%filter(first=="HEADING")%>%select(second)
+headings<-as.matrix(headings)[,]
+
+pivot_rad_kolumn<-trimws(paste0(stub,",",headings))
+pivot_rad_kolumn<-strsplit(pivot_rad_kolumn,",")[[1]]
+enhetsrubriker<-names(df2)[!names(df2) %in% pivot_rad_kolumn]
+df2<-pivot_longer(df2,cols=all_of(enhetsrubriker),names_to="Enhet")
+
+
+#Bearbetar datafilen (lägger till CODES) och annat
+
+if("Dag" %in% names(df2)){df2$Dag<-as.character(df2$Dag)}
+
+if("Datum" %in% names(df2)){df2$Datum<-as.character(df2$Datum)}
+
+df2<-df2%>%mutate(ID_variabel=fillista_rensad[i])
+
+if("År" %in% names(df2)){df2<-df2%>%
+	mutate(År2=År)%>%
+	relocate(År2, År)}
+
+if("Region" %in% names(df2)){df2<-df2%>%mutate(Region2=str_replace(Region,"^([0-9]+).*$","\\1"))%>%
+    relocate(Region2, Region)}
+
+if("Län" %in% names(df2)){df2<-df2%>%mutate(Län2=str_replace(Län,"^([0-9]+).*$","\\1"))%>%
+    relocate(Län2, Län)}
+
+if("Kommun" %in% names(df2)){df2<-df2%>%mutate(Kommun2=str_replace(Kommun,"^([0-9]+).*$","\\1"))%>%
+    relocate(Kommun2, Kommun)}
+
+#Vi gör en insats för jämställdheten här så att kvinnor alltid definieras som nr 1.
+#(Arbetsbesparingen detta medför är högst coincidental)
+
+if("Kön" %in% names(df2)){df2<-df2%>%
+	mutate(Kön2=ifelse(
+		Kön=="Totalt", "1+2", ifelse(
+		Kön=="Kvinnor","1",ifelse(
+		Kön=="Män","2","99"))))%>%
+    	relocate(Kön2, Kön)}
+
+
+a_vtag_mapping<-list(
+	`Enhetstyp`=c("Alla enhetstyper"="1+2+3+4",
+			"Allmän vård och omsorg"="1",
+			"Demens"="2",
+			"Korttid"="3",
+			"Psykiatri"="4",
+			.default="99"),
+	Enhet=c("Andel"="2",
+		"Antal"="1",
+		.default="99"),
+	Ålder=c("84 år och yngre"="2",
+		"85 år och äldre"="1",
+		"Totalt"="1+2",
+		.default="99")
+	)
+
+b_risk_mapping <- list(
+  `Typ av riskfaktor` = c("Urinkateter"="1", 
+			"Trycksår"="2", 
+			"Andra sår"="3", 
+			"Kirurgiskt ingrepp"="4", 
+			"Kärlkateter"="5", 
+			.default="99"),
+  Enhet = c("Andel"="2", 
+		"Antal med riskfaktor"="1", 
+		"Lägre 95 % konfidensintervall"="3", 
+		"Övre 95 % konfidensintervall"="4", 
+		"Totalt antal vårdtagare"="5", 
+		.default="99"),
+  `Typ av boendeplats` = c("Totalt"="1+2", 
+				"Korttidsplats"="1", 
+				"Permanent boende"="2",
+				.default=NA)
+)
+
+# Define the mapping for 'c_vtyngd'
+c_vtyngd_mapping <- list(
+  `Typ av vårdtyngd` = c("Inkontinens"="1", 
+			"Desorientering"="2", 
+			"Nedsatt rörlighet"="3",
+			 .default="99"),
+  Enhet = c(
+		"Andel"="2", 
+		"Antal med vårdtyngd"="1", 
+		"Totalt antal vårdtagare"="3",
+		 .default="99")
+)
+
+
+d_vri_mapping<-list(
+	VRI=c("Hudinf. Totalt"="1",
+		"Luftvägsinf. Totalt"="2",
+		"Urinvägsinf. Totalt"="3",
+		"VRI Totalt"="4",
+		.default="99"),
+	Enhet=c("Andel"="2",
+		"Antal"="1",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Totalt antal vårdtagare"="5",
+		 .default="99"))
+
+e_vririsk_mapping<-list(
+	VRI=c(
+		"Hudinf. + andra sår"="1",
+		"Hudinf. + trycksår"="2",
+		"Hudinf. + båda kat."="3",
+		"Hudinf. Ej sår"="4",
+		"Urinvägsinf. + KAD"="5",
+		"Urinvägsinf. Ej KAD"="6",
+		.default="99"),
+	Enhet=c("Andel"="2",
+		"Antal"="1",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Totalt antal vårdtagare"="5",
+		.default="99"))
+
+ea_abtot_mapping<-list(
+	Antibiotikaanvändning=c(
+		"Totalt"="1+2+3+4",
+		"Hud och mjukdelar"="1",
+		"Urinvägar"="2",
+		"Luftvägar"="3",
+		"Övriga"="4",
+		.default="99"),
+	Enhet=c("Andel"="2",
+		"Antal"="1",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Totalt antal vårdtagare"="5",
+		.default="99"
+		))
+
+
+
+f_abkrslok_mapping<-list(
+	Behandlingsform=c(
+		"Infektionsbehandling"="1",
+		"Profylax"="2",
+		.default="99"),
+	Kroppslokal=c(
+		"Alla"="1+2+3+4",
+		"Hud- och mjukdelar"="1",
+		"Luftvägar"="2",
+		"Urinvägar"="3",
+		"Övriga"="4",
+		.default="99"),
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Totalt antal förskrivningar"="1"
+))
+
+
+
+g_abatc_mapping<-list(
+	Behandlingsform=c(
+		"Alla"="3",
+		"Infektionsbehandling"="1",
+		"Profylax"="2",
+		.default="99"),
+	`ATC-kod`=c(
+		"Alla antibiotika"="0",
+		"J01AA - tetracykliner"="J01AA",
+		"J01CA - penicilliner med utvidgat spektrum exkl J01CA08 - pivmecillinam"="J01CA",
+		"J01CA08 - pivmecillinam"="J01CA08",
+		"J01CE - betalaktamaskänsliga penicilliner"="J01CE",
+		"J01CF - betalaktamasresistenta penicilliner"="J01CF",
+		"J01CR - kombinationer av penicilliner, inkl kombinationer med betalaktamas-hämmare"="J01CR",
+		"J01DB-DE - Cefalosporiner"="J01DB-DE",
+		"J01EA - trimetoprim och derivat"="J01EA",
+		"J01EE - kombinationer av sulfonamider"="J01EE",
+		"J01FA - makrolider"="J01FA",
+		"J01FF - linkosamider"="J01FF",
+		"J01MA - fluorokinoloner"="J01MA",
+		"J01XE - nitrofuranderivat"="J01XE",
+		"J01XX - övriga antibakteriella medel"="J01XX",
+		"Övriga"="XX",
+		.default="99"),
+	Enhet=c(
+		"Antal"="1",
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		.default="99"
+))
+
+h_diagurin_mapping<-list(
+	Diagnos=c(
+		"Cystit (blåskatarr)"="2",
+		"Pyelonefrit (njurbäckeninfektion)"="3",
+		"Annan diagnos"="1",
+		"Ingen diagnos angiven"="4",
+		"Alla"="5",
+		.default="99"),
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal förskrivningar"="1",
+		.default="99")
+)
+
+i_diaghud_mapping<-list(
+	Diagnos=c(
+		"Infekterat svårläkt sår"="1",
+		"Infekterat akut sår (ex. traumatiskt sår, paronychi)"="2",
+		"Postoperativ sårinfektion, ytlig eller djup"="3",
+		"Erysipelas (rosfeber)"="4",
+		"Abscess (böld), ytlig eller djup"="5",
+		"Impetigo (svinkoppor)"="6",
+		"Herpes zoster (bältros)"="7",
+		"Annan diagnos"="8",
+		"Ingen diagnos angiven"="9",
+		"Alla"="10",
+		.default="99"),
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal förskrivningar"="1",
+		.default="99")
+)
+
+j_diagluft_mapping<-list(
+	Diagnos=c(
+		"Pneumoni (lunginflammation)"="7",
+		"Kronisk bronkit/akut exacerbation av KOL"="5",
+		"Akut bronkit (luftrörskatarr)"="1",
+		"Rhinit (förkylning/ÖLI)"="8",
+		"Laryngit (halsinfektion)"="6",
+		"Influensa"="3",
+		"Annan diagnos"="2",
+		"Ingen diagnos angiven"="4",
+		"Alla"="9",
+		.default="99"),
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal förskrivningar"="1",
+		.default="99")
+	
+)
+
+k_abfvuvi_mapping<-list(
+	Enhet=c(
+		"Andel pivmecillinam/nitrofurantoin"="2", 
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal pivmecillinam/nitrofurantoin"="1",
+		"Total antal förskrivningar"="5",
+		.default="99")
+	)
+
+l_abfvhud_mapping<-list(
+	Enhet=c(
+		"Andel penicillin V/flukloxacillin"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal penicillin V/flukloxacillin"="1",
+		"Total antal förskrivningar"="5",
+		.default="99"
+))
+
+m_abfvluft_mapping<-list(
+	Enhet=c(
+		"Andel penicillin V"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal penicillin V"="1",
+		"Total antal förskrivningar"="5",
+		.default="99"))
+
+n_aburin_mapping<-list(
+	Riskfaktor=c(
+		"med urinkateter"="2",
+		"utan urinkateter"="1",
+		.default="99"),
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal"="1",
+		"Totalt antal vårdtagare"="5",
+		.default="99")
+)
+
+o_absar_mapping<-list(
+	Riskfaktor=c(
+		"med andra sår"="2",
+		"med trycksår"="1",
+		"samtidigt trycksår och andra sår"="3",
+		"utan sår"="4",
+		.default="99"),
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal"="1",
+		"Total antal vårdtagare"="5",
+		.default="99"
+))
+
+p_abodl_mapping<-list(
+	Kroppslokal=c(
+		"Totalt"="4",
+		"Hud- och mjukdelar"="1",
+		"Luftvägar"="2",
+		"Urinvägar"="3",
+		.default="99"
+),
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal odlingsprov tagna vid förskrivning"="1",
+		"Totalt antal förskrivningar"="5",
+		.default="99"
+))
+
+
+#Regionfiler
+
+a_deltagreg_mapping<-list(
+	Enhet=c(
+		"Totalt antal kommuner i län"="2",
+		"Antal deltagande kommuner"="1")
+)
+
+b_vtagreg_mapping<-list(
+	Enhetstyp=c(
+		"Alla enhetstyper"="5",
+		"Allmän vård och omsorg"="1",
+		"Demens"="2",
+		"Korttid"="3",
+		"Psykiatri"="4",
+		.default="99"),
+	Enhet=c("Andel"="2")
+)
+
+c_vtagkonreg_mapping<-list(
+	Enhet=c(
+		"Antal"="1",
+		"Andel"="2")
+)
+
+
+d_haltriskreg_mapping<-list(
+	Riskfaktor=c(
+		"Andra sår"="1",
+		"Kirurgiskt ingrepp"="2",
+		"Trycksår"="3",
+		"Urinkateter"="4"
+),
+	Boendetyp=c(
+		"Korttidsplats"="1",
+		"Permanent boende"="2",
+		"Totalt"="1+2"
+),
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal med riskfaktor"="1",
+		"Totalt antal vårdtagare"="5"
+))
+
+
+e_vtyngdreg_mapping<-list(
+	Vårdtyngd=c(
+		"Desorientering"="1",
+		"Inkontinens"="2",
+		"Nedsatt rörlighet"="3"
+),			
+	Enhet=c(
+		"Andel"="2",
+		"Antal med vårdtyngd"="1",
+		"Totalt antal vårdtagare"="5")
+)
+
+f_vrireg_mapping<-list(
+	VRI=c(
+		"Hudinf. Totalt"="1",
+		"Urinvägsinf. Totalt"="2",
+		"VRI Totalt"="1+2"
+),			
+	Enhet=c(
+		"Antal"="1",
+		"Totalt antal vårdtagare"="5",
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4"
+)
+)
+
+g_abanvandningreg_mapping<-list(
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal"="1",
+		"Totalt antal vårdtagare"="5"
+))
+
+h_abatcreg_mapping<-list(
+	`ATC-kod`=c(
+		"Alla antibiotika"="00",
+		"J01AA - tetracykliner"="J01AA",
+		"J01CA - penicilliner med utvidgat spektrum exkl J01CA08 - pivmecillinam"="J01CA",
+		"J01CA08 - pivmecillinam"="J01CA08",
+		"J01CE - betalaktamaskänsliga penicilliner"="J01CE",
+		"J01CF - betalaktamasresistenta penicilliner"="J01CF",
+		"J01CR - kombinationer av penicilliner, inkl kombinationer med betalaktamas-hämmare"="J01CR",
+		"J01DB-DE - Cefalosporiner"="J01DB-DE",
+		"J01EA - trimetoprim och derivat"="J01EA",
+		"J01EE - kombinationer av sulfonamider"="J01EE",
+		"J01FA - makrolider"="J01FA",
+		"J01FF - linkosamider"="J01FF",
+		"J01MA - fluorokinoloner"="J01MA",
+		"J01XE - nitrofuranderivat"="J01XE",
+		"J01XX - övriga antibakteriella medel"="J01XX",
+		"Övriga"="XX"
+),			
+	Enhet=c(
+		"Antal antibiotika"="1",
+		"Totalt antal antibiotika"="00"
+)
+)
+
+i_abodlingreg_mapping<-list(
+	Enhet=c(
+		"Antal odlingsprov tagna vid förskrivning"="1",
+		"Totalt antal förskrivningar"="00"
+)
+)
+
+j_abtotlokalreg_mapping<-list(
+	Kroppslokal=c(
+		"Totalt"="1+2+3",
+		"Hud och mjukdelar"="1",
+		"Urinvägar"="2",
+		"Övriga inkl. Luftvägar"="3"),			
+	Enhet=c(
+		"Andel"="2",
+		"Lägre 95 % konfidensintervall"="3",
+		"Övre 95 % konfidensintervall"="4",
+		"Antal"="1",
+		"Totalt antal vårdtagare"="5")
+)
+
+a_deltagkn_mapping<-list(
+	Enhet=c(
+		"Deltagit"="1", 
+		"Ej deltagit"="0"
+))
+
+
+
+mappings <- list(
+	a_vtag		=	a_vtag_mapping,
+  	b_risk 		= 	b_risk_mapping,
+  	c_vtyngd 	= 	c_vtyngd_mapping,
+	d_vri		=	d_vri_mapping,
+	e_vririsk	=	e_vririsk_mapping,
+	ea_abtot	=	ea_abtot_mapping,
+	f_abkrslok	=	f_abkrslok_mapping,
+	g_abatc		=	g_abatc_mapping,
+	h_diagurin	=	h_diagurin_mapping,
+	i_diaghud	=	i_diaghud_mapping,
+	j_diagluft	=	j_diagluft_mapping,
+	k_abfvuvi	=	k_abfvuvi_mapping,
+	l_abfvhud	=	l_abfvhud_mapping,
+	m_abfvluft	=	m_abfvluft_mapping,
+	n_aburin	=	n_aburin_mapping,
+	o_absar		=	o_absar_mapping,
+	p_abodl		=	p_abodl_mapping,
+	a_deltagreg	=	a_deltagreg_mapping,
+	b_vtagreg	=	b_vtagreg_mapping,
+	c_vtagkonreg	=	c_vtagkonreg_mapping,
+	d_haltriskreg	=	d_haltriskreg_mapping,
+	e_vtyngdreg	=	e_vtyngdreg_mapping,
+	f_vrireg	=	f_vrireg_mapping,
+	g_abanvandningreg	=	g_abanvandningreg_mapping,
+	h_abatcreg	=	h_abatcreg_mapping,
+	i_abodlingreg	=	i_abodlingreg_mapping,
+	j_abtotlokalreg	=	j_abtotlokalreg_mapping,
+	a_deltagkn	=	a_deltagkn_mapping
+
+	
+  # ... add more mappings as needed
+)
+
+transform_df <- function(df, ID, col_mapping) {
+  if (unique(str_detect(df$ID_variabel, ID))) {
+    # Create or modify columns
+    for (col_name in names(col_mapping)) {
+      new_col_name <- paste0(col_name, "2")
+      df <- df %>%
+        mutate(!!new_col_name := recode(!!sym(col_name), !!!col_mapping[[col_name]]))
+    }
+
+    # Adjust column order
+    ordered_cols <- c()
+    for (col_name in names(col_mapping)) {
+      new_col_name <- paste0(col_name, "2")
+      ordered_cols <- c(ordered_cols, new_col_name, col_name)
+    }
+    other_cols <- setdiff(names(df), ordered_cols)
+    df <- df[, c(ordered_cols, other_cols)]
+  }
+  return(df)
+}
+
+  
+unique_ids <- unique(df2$ID_variabel)
+
+for(id in unique_ids) {
+
+  # If the prefix exists in the names of the mappings list, apply the corresponding mapping
+  if(id %in% names(mappings)) {
+    df2 <- transform_df(df2, id, mappings[[id]])
+  }
+}
+
+#In this version, after creating all the new columns, we build a vector ordered_cols that holds the #desired #sequence of columns (new columns immediately followed by their original counterparts). We #then rearrange the #dataframe columns based on this order.
+
+
+
+
+#Tar bort ID-variabel
+
+df2<-df2%>%select(-ID_variabel)
+
+
+#Lägger till rubrik
+
+    df2<- rbind(c(tabellrubrik$second, rep(NA, ncol(df2) - 1)), names(df2), df2)
+
+    df2<-t(as.matrix(df2))
+    df2<-as.data.frame(df2)%>%mutate(V2=str_replace(V2,"(.*)2","\\1"),V2)
+    df2<-as.data.frame(t(as.matrix(df2)))
+
+#Exporterar som vanligt
+
+write.table(as.data.frame(df2),file=
+                     paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers\\",fillista[i]), 
+		     row.names = FALSE,col.names=FALSE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+
+write.table(full_control,
+file=paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\kontrollfiler2\\",fillista_rensad[i],".csv"),
+row.names = FALSE,col.names=FALSE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+}
+#För körning i kommanmdotolken 
+#Vi skapar en lång kodrad med rätt kod för att köra pxjob i kommandotolken
+#och skapa px-filer från våra datset och våra kontrollfiler.
+
+cmd<-gsub("\\n","",paste0("cd /D C:\\Program Files (x86)\\PX-Edit 2019 ver 4.0 && ",paste0("Pxjob job=px path=\"G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\" in=\"\\In_headers\\",fillista,"\" 
+out=\"\\Out HALT\" meta=\"\\kontrollfiler2\\",fillista_rensad,".csv\" log=\"\\log\\log.txt\"", TIMEVAL_VECTOR, collapse=" && ")))
+
+#Vi sparar detta som en extern fil (denna kan behöva raderas om den inte uppdateras).
+
+fileConn<-file("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\Script\\output.txt")
+writeLines(c(cmd), fileConn)
+close(fileConn)

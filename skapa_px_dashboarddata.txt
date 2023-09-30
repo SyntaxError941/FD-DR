@@ -1,0 +1,939 @@
+#Vi läser in våra bibliotek
+
+library(DBI)
+library(odbc)
+library(tidyverse)
+library(openxlsx)
+library(readxl)
+
+#NOTERA! Vi måste ha korrekt version av Java installerat för att köra xlsx:
+#https://www.java.com/en/download/manual.jsp
+
+#Vi stänger av scientific notation
+
+options(scipen=999)
+
+#Definierar parametrar - UPPDATERA VID BEHOV
+
+aktuell_dos_from_datum<-"2023-03-01"
+aktuell_dos_stoppdatum<-"2023-08-27"
+age_year<-"2022"
+
+#Vi skapar ett connection-objekt, en permanent anslutning till en mapp på servern, som vi sedan kan referera till.
+
+con <- dbConnect(odbc::odbc(), "vacc_reg")
+
+
+
+# DIVERSE HJÄLPTABELLER
+
+Nolldata <- read_excel("~/Vaccinationsregister/Automatiseringar/Automatisering dashboard/Grunddata.xlsx", 
+    sheet = "Nolldata")
+
+Kombinationer_till_nolldata<-Nolldata%>%
+    mutate(
+        nof_dose=as.numeric(nof_dose),
+        dummy_key=1)%>%
+    full_join(veckor,by=c("dummy_key"))%>%
+	select(-dummy_key)
+
+nämnare_region<-dbGetQuery(con,"select [d].[code], sum([d].[nof]) as Antal from [NVR_Stat].[dbo].[DenominatorCounty] d where [d].[agegroup1] <> '-12' group by [d].[code]")
+
+nämnare_region<-nämnare_region%>%
+	add_row(code="00",Antal=sum(nämnare_region$Antal))%>%
+	rename("Pop"="Antal")
+
+
+
+kommun_nämnare_5_år<-dbGetQuery(con,"select [d].[code], [d].[name], [d].[agegroup2], sum([d].[nof]) as Antal from [NVR_Stat].[dbo].[DenominatorMunicipality] d where [d].[agegroup2] <> '-12' group by [d].[code], [d].[name], [d].[agegroup2]")
+
+
+#Uthämtning av data från server, samt bearbetning
+
+antal_vaccinerade<-dbGetQuery(con,"select [v].[region], [c].[name], [v].[vaccweek], [v].[nof_dose], [v].[agegroup], sum([v].[nof]) as Antal from [NVR_Stat].[dbo].[Weekly_Cov_vaccination_01] v join [NVR_Stat].[dbo].[Counties] c on [c].[code] = [v].[region] where [v].[vacctype] <> 'COVID-19 Vaccine Janssen' and [v].[idstat] = 'valid' and [v].[agegroup] <> '-12' and [v].[unregistered] = 'false' group by [v].[region], [c].[name], [v].[vaccweek], [v].[nof_dose], [v].[nof_dose], [v].[agegroup]")
+
+antal_vaccinationer<-dbGetQuery(con,"select [v].[region], [c].[name], [v].[vaccweek], [v].[nof_dose], sum([v].[nof]) as Antal from [NVR_Stat].[dbo].[Weekly_Cov_vaccination_01] v join [NVR_Stat].[dbo].[Counties] c on [c].[code] = [v].[region] group by [v].[region], [c].[name], [v].[vaccweek], [v].[nof_dose]")
+
+veckor<-antal_vaccinationer%>%
+    select(vaccweek)%>%
+    unique()%>%
+    mutate(dummy_key=1)
+	
+
+# ANTAL VACCINATIONER
+
+
+antal_vaccinationer<-antal_vaccinationer%>%
+	mutate(Antal=ifelse(Antal<5,0,Antal))%>%
+	bind_rows(Kombinationer_till_nolldata)%>%
+	mutate(nof_dose=as.character(nof_dose))%>%
+	group_by(region,name,vaccweek)%>%
+	mutate(Antal=sum(Antal))%>%
+	select(-nof_dose)%>%
+	unique()%>%
+	ungroup()%>%
+	arrange(region,vaccweek)%>%
+	mutate(sort_order=1)
+	
+
+summary_rows <- antal_vaccinationer%>%
+    group_by(vaccweek) %>%
+    summarise(Antal = sum(Antal), region = "00", name="| Sverige |", sort_order=0, .groups = "drop") 
+
+antal_vaccinationer<-antal_vaccinationer%>%
+    bind_rows(summary_rows) %>%
+    arrange(vaccweek,sort_order,region)%>%
+    fill(everything())%>%
+    select(-sort_order,-region)%>%
+    separate(vaccweek, into = c("År", "Vecka"), sep = "-")%>%
+	rename("Region"="name", "Antal vaccinationer"="Antal")%>%
+	select(Vecka,År,Region,`Antal vaccinationer`)
+
+
+
+
+# ANTAL VACCINERADE PER REGION - DOS 3
+
+## SKAPAR NOLLDATA FÖR DOS 3
+
+Nolldata_dos_3<-Nolldata%>%
+	mutate(nof_dose=3)%>%
+	unique()%>%
+	mutate(dummy_key=1)%>%
+	full_join(veckor,by=c("dummy_key"))%>%
+	filter(vaccweek>="2021-35")
+
+## SKAPAR HUVUDDATASETET
+	
+
+antal_vacc3<-antal_vaccinerade%>%
+    filter(nof_dose==3 & !agegroup %in% c("-12","12-15","16-17"))%>%
+    bind_rows(Nolldata_dos_3)%>%
+    select(-dummy_key,-agegroup)%>%
+    group_by(region,vaccweek)%>%
+    mutate(Antal=sum(Antal))%>%
+    unique()%>%
+    ungroup()%>%
+    arrange(region,vaccweek)%>%
+    mutate(Antal=ifelse(Antal<5,0,Antal))%>%
+    group_by(region)%>%
+    mutate(Antal=cumsum(Antal),
+           sort_order=0)%>%
+    ungroup()
+
+summary_rows <- antal_vacc3%>%
+    group_by(vaccweek) %>%
+    summarise(Antal = sum(Antal), region = "00", name="| Sverige |", nof_dose=3,sort_order=1, .groups = "drop") 
+
+antal_vacc3<-antal_vacc3%>%
+    bind_rows(summary_rows) %>%
+    arrange(vaccweek,sort_order,region)%>%
+    fill(everything())%>%
+    select(-sort_order)
+
+##SKAPAR NÄMNARDATA
+
+nämnare_region_18plus<-dbGetQuery(con,"select [d].[code] as region, sum([d].[nof]) as Antal_totalt from [NVR_Stat].[dbo].[DenominatorCounty] d where [d].[agegroup1] <> '-12' and [d].[agegroup1] <> '12-15' and [d].[agegroup1] <> '16-17' group by [d].[code]")
+
+nämnare_region_18plus<-nämnare_region_18plus%>%add_row(region="00", Antal_totalt=sum(nämnare_region_18plus$Antal_totalt))
+
+#JOINAR MED NÄMNARDATA SAMT BEARBETAR
+
+antal_vacc3<-antal_vacc3%>%
+    full_join(nämnare_region_18plus,by=c("region"))%>%
+    mutate(
+        andel=Antal/Antal_totalt,
+        name=str_replace(name,"s län",""))%>%
+    mutate(name=str_replace(name,"län",""))%>%
+    mutate(nof_dose=str_replace((as.character(nof_dose)),"3","3 doser"))%>%
+    rename("Region"="name",
+           "Antal vaccinerade"="Antal",
+           "Andel vaccinerade"="andel",
+           "Vaccinationsstatus"="nof_dose")%>%
+    select(-Antal_totalt,Vaccinationsstatus )%>%
+    separate(vaccweek, into = c("År", "Vecka"), sep = "-")%>%
+	select(Vecka, År, Region, `Antal vaccinerade`, `Andel vaccinerade`)
+
+
+# ANTAL VACCINERADE PER REGION - AKTIV DOS
+
+## SKAPAR NOLLDATA FÖR AKTIV DOS
+### Av oklar anledning har vi här ingen filtrering
+
+Nolldata_aktiv<-Nolldata%>%
+    mutate(nof_dose="aktiv")%>%
+    unique()%>%
+    mutate(dummy_key=1)%>%
+    full_join(veckor,by=c("dummy_key"))
+
+## SKAPAR HUVUDDATASETET
+
+
+
+uttag_aktiv_dos<-dbGetQuery(con,paste0("select [p].[person_id], [p].[county_code] as region, [c].[name], [t].[vaccweek] from [dbo].[DoseNums] DN join [dbo].[person] p on [p].[person_id] = [DN].[person_id] left join [dbo].[tally_dates] t on [DN].[vaccination_date] = [t].[date] left join [dbo].[counties] c on [p].[county_code] = [c].[code] where [p].[county_code] <> '' and CAST('",age_year,"' as INT)-[p].[birth_year] >= 18 and [p].[id_status] = 'valid' and [p].[unregistered] = 'false' and [DN].[dose_number] >=3 and [DN].[vaccination_date] >= CAST('",aktuell_dos_from_datum,"' as DATE) and [DN].[vaccination_date] <= CAST('",aktuell_dos_stoppdatum,"' as DATE)"))
+
+uttag_aktiv_dos<-uttag_aktiv_dos%>%
+	filter(region!="00")%>%
+	arrange(person_id,vaccweek)%>%
+	distinct(person_id,.keep_all=TRUE)%>%
+	group_by(region,name,vaccweek)%>%
+	mutate(Antal=sum(n()))%>%
+	select(-person_id)%>%
+	unique()%>%
+	arrange(region,name,vaccweek)%>%
+	mutate(Antal=cumsum(Antal),
+        sort_order=0)%>%
+        ungroup()%>%
+	mutate(nof_dose="aktiv")
+
+summary_rows <- uttag_aktiv_dos%>%
+    group_by(vaccweek) %>%
+    summarise(Antal = sum(Antal), region = "00", name="| Sverige |", nof_dose="aktiv",sort_order=1, .groups = "drop") 
+
+
+reg_aktiv_dos<-uttag_aktiv_dos%>%
+    bind_rows(summary_rows) %>%
+    arrange(vaccweek,sort_order,region)%>%
+    select(-sort_order)
+
+##SKAPAR NÄMNARDATA
+
+nämnare_region_18plus<-dbGetQuery(con,"select [d].[code] as region, sum([d].[nof]) as Antal_totalt from [NVR_Stat].[dbo].[DenominatorCounty] d where [d].[agegroup1] <> '-12' and [d].[agegroup1] <> '12-15' and [d].[agegroup1] <> '16-17' group by [d].[code]")
+
+nämnare_region_18plus<-nämnare_region_18plus%>%add_row(region="00", Antal_totalt=sum(nämnare_region_18plus$Antal_totalt))
+
+#JOINAR MED NÄMNARDATA SAMT BEARBETAR
+
+reg_aktiv_dos<-reg_aktiv_dos%>%
+    full_join(nämnare_region_18plus,by=c("region"))%>%
+    mutate(
+        andel=Antal/Antal_totalt,
+        name=str_replace(name,"s län",""))%>%
+    mutate(name=str_replace(name,"län",""))%>%
+    mutate(nof_dose=str_replace((as.character(nof_dose)),"3","3 doser"))%>%
+    rename("Region"="name",
+           "Antal vaccinerade"="Antal",
+           "Andel vaccinerade"="andel",
+           "Vaccinationsstatus"="nof_dose")%>%
+    select(-Antal_totalt,Vaccinationsstatus )%>%
+    separate(vaccweek, into = c("År", "Vecka"), sep = "-")%>%
+	select(Vecka, År, Region, `Antal vaccinerade`, `Andel vaccinerade`)
+
+
+
+#ANTAL VACCINERADE PER KOMMUN - DOS 3
+
+## NÄMNARDATA KOMMUN
+
+nämnare_kommun_inkl_ålder<-dbGetQuery(con,"select [d].[code], [d].[name], [d].[agegroup1], [d].[agegroup2], sum([d].[nof]) as Antal from [NVR_Stat].[dbo].[DenominatorMunicipality] d where [d].[agegroup1] <> '-12' group by [d].[code], [d].[name], [d].[agegroup1], [d].[agegroup2]")
+
+
+nämnare_kommun_18_plus<-nämnare_kommun_inkl_ålder%>%
+    filter(!agegroup1 %in% c("12-15","16-17"))%>%
+    mutate(agegroup=ifelse(
+        agegroup1 %in% c("18-29","30-39","40-49"),"18-49",ifelse(
+        agegroup1=="50-59"|agegroup2=="60-64", "50-64",ifelse(
+        agegroup2=="65-69"|agegroup1=="70-79","65-79",ifelse(
+        agegroup1 %in% c("80-89","90 eller äldre"),"80+","NA")))))%>%
+    group_by(name,agegroup)%>%
+    mutate(Antal=sum(Antal))%>%
+    ungroup()%>%
+    select(-agegroup1,-agegroup2)%>%
+    unique()%>%
+    arrange(name, agegroup)
+
+summary_rows <- nämnare_kommun_18_plus%>%
+    group_by(name) %>%
+    summarise(Antal = sum(Antal), agegroup = "Total 18+", .groups = "drop") 
+
+nämnare_kommun_18_plus <- nämnare_kommun_18_plus %>%
+    bind_rows(summary_rows) %>%
+    arrange(name)%>%
+    rename("Antal_Totalt"="Antal")%>%
+fill(everything())
+
+##HUVUDTABELL
+
+kommun_dos_3<-dbGetQuery(con,"select [v].[nof_dose],[v].[region],[c].[name] as [regionname],[v].[kommun],[m].[name] as [kommunname], [v].[agegroup1], [v].[agegroup2], sum([v].[nof]) as Antal from [dbo].[Age_Gender_Cov_vaccination_01] v left join [dbo].[Counties] c on [v].[region] = [c].[code] left join [dbo].[Municipalities] m on [v].[kommun] = [m].[code] where [v].[vacctype] <> 'COVID-19 Vaccine Janssen' and [v].[idstat] = 'valid' and [v].[region] <> '00' and [v].[kommun] <> '0000' and [v].[nof_dose] = 3 and [v].[unregistered] = 'false' and ([v].[agegroup1] <> '-12' and [v].[agegroup1] <> '12-15' and [v].[agegroup1] <> '16-17') group by [v].[region], [c].[name], [v].[kommun], [m].[name], [v].[nof_dose], [v].[agegroup1], [v].[agegroup2]"
+)
+
+kommun_dos_3<-kommun_dos_3%>%
+    mutate(agegroup=ifelse(
+        agegroup1 %in% c("18-29","30-39","40-49"),"18-49",ifelse(
+        agegroup1=="50-59"|agegroup2=="60-64", "50-64",ifelse(
+        agegroup2=="65-69"|agegroup1=="70-79","65-79",ifelse(
+        agegroup1 %in% c("80-89","90 eller äldre"),"80+","NA")))))%>%
+    group_by(kommun,agegroup)%>%
+    mutate(Antal=sum(Antal))%>%
+    ungroup()%>%
+	select(-agegroup1,-agegroup2)%>%
+	unique()%>%
+	arrange(kommun, agegroup)
+
+summary_rows <- kommun_dos_3 %>%
+    group_by(kommun) %>%
+    summarise(Antal = sum(Antal), agegroup = "Total 18+", .groups = "drop") 
+
+kommun_dos_3 <- kommun_dos_3 %>%
+    bind_rows(summary_rows) %>%
+    arrange(kommun)%>%
+	fill(everything())
+
+kommun_dos_3<-kommun_dos_3%>%
+	full_join(nämnare_kommun_18_plus,by=c("kommunname"="name","agegroup"="agegroup","kommun"="code"))%>%
+	mutate(andel=Antal/Antal_Totalt)%>%
+	rename("KnNamn"="kommunname", "KnKod"="kommun", "Åldersgrupp"="agegroup", "Antal vaccinerade"="Antal", "Andel vaccinerade"="andel")%>%
+    select(KnKod,KnNamn, Åldersgrupp,`Antal vaccinerade`,`Andel vaccinerade`)
+	
+	
+
+#ANTAL VACCINERADE PER KOMMUN - AKTUELL DOS
+
+aktuell_dos_veckor<-dbGetQuery(con,paste0("select distinct [t].[vaccweek] from [dbo].[DoseNums] v left join [dbo].[tally_dates] t on [v].[vaccination_date] = [t].[date] where [v].[vaccination_date] >= '",aktuell_dos_from_datum,"' and [v].[vaccination_date] <= '",aktuell_dos_stoppdatum,"'"))
+
+
+kommun_aktiv_dos<-dbGetQuery(con,paste0("select distinct [p].[person_id], [p].[county_code] as region, [c].[name] as [regionname], [p].[municipality_code] as kommun,[m].[name] as [kommunname],  CAST('",age_year,"' AS INT)-[p].[birth_year] as age from [dbo].[DoseNums] DN join [dbo].[person] p on [DN].[person_id] = [p].[person_id] left join [dbo].[Counties] c on [p].[county_code] = [c].[code] left join [dbo].[Municipalities] m on [p].[municipality_code] = [m].[code] where [p].[id_status] = 'valid' and [p].[county_code] <> '00' and [p].[municipality_code] <> '0000' and [DN].[dose_number] >= 3 and [p].[unregistered] = 'false' and CAST('",age_year,"' AS INT)-[p].[birth_year] >= 18 and [DN].[vaccination_date] >= '",aktuell_dos_from_datum,"' and [DN].[vaccination_date] <= '",aktuell_dos_stoppdatum,"'"))
+
+kommun_aktiv_dos<-kommun_aktiv_dos%>%
+    mutate(agegroup=ifelse(
+        age>=18 & age <=49,"18-49",ifelse(
+        age>=50 & age <=64,"50-64",ifelse(
+        age>=65 & age <=79,"65-79",ifelse(
+        age>=80,"80+","NA")))))%>%
+    group_by(kommun,agegroup)%>%
+    mutate(Antal=sum(n()))%>%
+    select(-person_id,-age)%>%
+    ungroup()%>%
+    unique()%>%
+    arrange(kommun, agegroup)
+
+summary_rows <- kommun_aktiv_dos %>%
+    group_by(kommun) %>%
+    summarise(Antal = sum(Antal), agegroup = "Total 18+", .groups = "drop") 
+
+kommun_aktiv_dos <- kommun_aktiv_dos %>%
+    bind_rows(summary_rows) %>%
+    arrange(kommun)%>%
+    fill(everything())%>%
+    mutate(Antal=ifelse(Antal<5,NA,Antal))%>%
+	group_by(kommun)%>%
+	mutate(Antal_missing=sum(is.na(Antal)))%>%
+	mutate(Antal=ifelse(Antal_missing>=3,NA,Antal))%>%
+	select(-Antal_missing)%>%
+	ungroup()%>%
+	pivot_wider(names_from=agegroup,values_from=Antal)%>%
+	mutate(
+    		`18-49` = ifelse(
+      (is.na(`50-64`) & !is.na(`65-79`) & !is.na(`80+`)) |
+      (!is.na(`50-64`) & is.na(`65-79`) & !is.na(`80+`)) |
+      (!is.na(`50-64`) & !is.na(`65-79`) & is.na(`80+`)),
+      NA,
+      `18-49`
+    ),
+	`50-64` = ifelse(
+      (is.na(`18-49`) & !is.na(`65-79`) & !is.na(`80+`)) |
+      (!is.na(`18-49`) & is.na(`65-79`) & !is.na(`80+`)) |
+      (!is.na(`18-49`) & !is.na(`65-79`) & is.na(`80+`)),
+      NA,
+      `50-64`
+    )
+  )%>%
+	pivot_longer(c(`18-49`,`50-64`,`65-79`,`80+`,`Total 18+`),names_to = "agegroup",values_to = "Antal")
+
+kommun_aktiv_dos<-kommun_aktiv_dos%>%
+	full_join(nämnare_kommun_18_plus,by=c("kommunname"="name","agegroup"="agegroup","kommun"="code"))%>%
+	mutate(andel=Antal/Antal_Totalt)%>%
+	rename("KnNamn"="kommunname", "KnKod"="kommun", "Åldersgrupp"="agegroup", "Antal vaccinerade"="Antal", "Andel vaccinerade"="andel")%>%
+	select(KnKod,KnNamn,Åldersgrupp,`Antal vaccinerade`,`Andel vaccinerade`)
+
+
+#ANTAL VACCINERADE UPPDELAT PÅ ÅLDER
+
+##RÄKNAR UT NÄMNARDATA
+
+nämnare_ålder<-dbGetQuery(con,"select [d].[code], [d].[name], [d].[agegroup1], [d].[agegroup2], sum([d].[nof]) as Antal from [NVR_Stat].[dbo].[DenominatorCounty] d where [d].[agegroup1] <> '-12' group by [d].[code], [d].[name], [d].[agegroup1], [d].[agegroup2]
+")
+
+nämnare_ålder<-nämnare_ålder%>%
+    mutate(agegroup=ifelse(
+        agegroup1 %in% c("18-29","30-39","40-49"),"18-49",ifelse(
+        agegroup1=="50-59"|agegroup2=="60-64", "50-64",ifelse(
+        agegroup2=="65-69"|agegroup1=="70-79","65-79",ifelse(
+        agegroup1 %in% c("80-89","90 eller äldre"),"80+","under 18")))))%>%
+    filter(agegroup!="under 18")%>%
+	group_by(code,name,agegroup)%>%
+	mutate(Antal=sum(Antal),
+		sort_order=0)%>%
+	select(-agegroup1,-agegroup2)%>%
+	unique()
+
+summary_rows <- nämnare_ålder%>%
+    group_by(code,name)%>%
+    summarise(Antal = sum(Antal), agegroup = "Totalt 18+",sort_order=1, .groups = "drop") 
+
+nämnare_ålder<-nämnare_ålder%>%
+    bind_rows(summary_rows) %>%
+    arrange(code,name,sort_order)%>%
+    fill(everything())%>%
+	mutate(sort_order2=1)
+
+summary_rows <- nämnare_ålder%>%
+    group_by(agegroup)%>%
+    summarise(Antal = sum(Antal), name = "| Sverige |", code="00",sort_order=0,sort_order2=0, .groups = "drop") 
+
+nämnare_ålder<-nämnare_ålder%>%
+    bind_rows(summary_rows) %>%
+    arrange(sort_order2,name,code,sort_order,agegroup)%>%
+    fill(everything())%>%
+	select(-sort_order,-sort_order2)%>%
+	rename("kod"="code", "Region"="name","Antal_totalt"="Antal")
+	
+
+
+##DOS 3 UPPDELAT PÅ ÅLDER
+
+
+dos3_ålder<-dbGetQuery(con,"select [v].[nof_dose],[v].[region],[c].[name] as [regionname],[v].[agegroup1], [v].[agegroup2], sum([v].[nof]) as Antal from [dbo].[Age_Gender_Cov_vaccination_01] v left join [dbo].[Counties] c on [v].[region] = [c].[code] left join [dbo].[Municipalities] m on [v].[kommun] = [m].[code] where [v].[vacctype] <> 'COVID-19 Vaccine Janssen' and [v].[idstat] = 'valid' and [v].[region] <> '00' and [v].[nof_dose] = 3 and ([v].[agegroup1] <> '-12' and [v].[agegroup1] <> '12-15' and [v].[agegroup1] <> '16-17') and [v].[unregistered] = 'false' group by [v].[region], [c].[name], [v].[agegroup1], [v].[agegroup2], [v].[nof_dose]")
+
+dos3_ålder<-dos3_ålder%>%
+    mutate(agegroup=ifelse(
+        agegroup1 %in% c("18-29","30-39","40-49"),"18-49",ifelse(
+        agegroup1=="50-59"|agegroup2=="60-64", "50-64",ifelse(
+        agegroup2=="65-69"|agegroup1=="70-79","65-79",ifelse(
+        agegroup1 %in% c("80-89","90 eller äldre"),"80+","NA")))))%>%
+	group_by(nof_dose,region,regionname,agegroup)%>%
+	mutate(Antal=sum(Antal),
+		sort_order=1)%>%
+	select(-agegroup1,-agegroup2)%>%
+	unique()
+
+summary_rows <- dos3_ålder%>%
+    group_by(nof_dose,region,regionname)%>%
+    summarise(Antal = sum(Antal), agegroup = "Totalt 18+",sort_order=1, .groups = "drop") 
+
+dos3_ålder<-dos3_ålder%>%
+    bind_rows(summary_rows) %>%
+    arrange(region,regionname,sort_order)%>%
+    fill(everything())%>%
+	mutate(sort_order2=1)
+
+summary_rows <- dos3_ålder%>%
+    group_by(agegroup)%>%
+    summarise(Antal = sum(Antal), regionname = "| Sverige |", region="00",nof_dose=3,sort_order=0,sort_order2=0, .groups = "drop") 
+
+
+
+dos3_ålder<-dos3_ålder%>%
+    bind_rows(summary_rows) %>%
+    arrange(sort_order2,region,regionname,sort_order,agegroup)%>%
+    fill(everything())%>%
+	select(-sort_order,-sort_order2)%>%
+	rename("kod"="region", "Region"="regionname")
+
+dos3_ålder<-dos3_ålder%>%
+	full_join(nämnare_ålder,by=c("kod","Region","agegroup"))%>%
+	mutate(andel=Antal/Antal_totalt)%>%
+	select(-Antal_totalt,kod)%>%
+	ungroup()%>%
+	unique()%>%
+	select(Region, agegroup,Antal,andel)%>%
+	rename("Åldersgrupp"="agegroup","Antal vaccinerade"="Antal", "Andel vaccinerade"="andel")
+
+
+##AKTUELL DOS UPPDELAT PÅ ÅLDER
+
+
+aktivdos_ålder<-dbGetQuery(con,paste0("select distinct [p].[person_id], [p].[county_code] as region, [c].[name] as [regionname], CAST('",age_year,"' AS INT)-[p].[birth_year] as age from [dbo].[DoseNums] DN join [dbo].[person] p on [DN].[person_id] = [p].[person_id] left join [dbo].[Counties] c on [p].[county_code] = [c].[code] where [p].[id_status] = 'valid' and [p].[county_code] <> '' and [DN].[dose_number] >= 3 and CAST('",age_year,"' AS INT) - [p].[birth_year] >= 18 and [DN].[vaccination_date] >= '",aktuell_dos_from_datum,"' and [DN].[vaccination_date] <= '",aktuell_dos_stoppdatum,"' and [p].[unregistered] = 'false' "))
+
+aktivdos_ålder<-aktivdos_ålder%>%
+    mutate(agegroup=ifelse(
+        age>=18 & age <=49,"18-49",ifelse(
+        age>=50 & age <=64,"50-64",ifelse(
+        age>=65 & age <=79,"65-79",ifelse(
+        age>=80,"80+","NA")))))%>%
+    group_by(region,agegroup)%>%
+    mutate(Antal=sum(n()))%>%
+    select(-person_id,-age)%>%
+	mutate(Antal=ifelse(Antal<5,0,Antal))%>%
+    ungroup()%>%
+    unique()%>%
+    arrange(region, agegroup)%>%
+	pivot_wider(names_from=agegroup,values_from=Antal)%>%
+	mutate(
+    		`18-49` = ifelse(
+      (is.na(`50-64`) & !is.na(`65-79`) & !is.na(`80+`)) |
+      (!is.na(`50-64`) & is.na(`65-79`) & !is.na(`80+`)) |
+      (!is.na(`50-64`) & !is.na(`65-79`) & is.na(`80+`)),
+      NA,
+      `18-49`
+    ),
+	`50-64` = ifelse(
+      (is.na(`18-49`) & !is.na(`65-79`) & !is.na(`80+`)) |
+      (!is.na(`18-49`) & is.na(`65-79`) & !is.na(`80+`)) |
+      (!is.na(`18-49`) & !is.na(`65-79`) & is.na(`80+`)),
+      NA,
+      `50-64`
+    )
+  )%>%
+	pivot_longer(c(`18-49`,`50-64`,`65-79`,`80+`),names_to = "agegroup",values_to = "Antal")
+
+summary_rows <- aktivdos_ålder%>%
+    group_by(region,regionname)%>%
+    summarise(Antal = sum(Antal), agegroup = "Totalt 18+",sort_order=1, .groups = "drop") 
+
+aktivdos_ålder<-aktivdos_ålder%>%
+    bind_rows(summary_rows) %>%
+    arrange(region,regionname,sort_order)%>%
+    fill(everything())%>%
+	mutate(sort_order2=1)
+
+summary_rows <- aktivdos_ålder%>%
+    group_by(agegroup)%>%
+    summarise(Antal = sum(Antal), regionname = "| Sverige |", region="00",sort_order=0,sort_order2=0, .groups = "drop") 
+
+
+aktivdos_ålder<-aktivdos_ålder%>%
+    bind_rows(summary_rows) %>%
+    arrange(sort_order2,region,regionname,sort_order,agegroup)%>%
+    fill(everything())%>%
+	select(-sort_order,-sort_order2)%>%
+	rename("kod"="region", "Region"="regionname")
+
+#Vi har återigen ett par observationer som har "00" i regionkod men inget regionnname. Vi slår ihop dem
+#med övriga siffror för Riket, då det år så vi gjort i originalmetoden
+
+aktivdos_ålder<-aktivdos_ålder%>%
+	full_join(nämnare_ålder,by=c("kod","Region","agegroup"))%>%
+	mutate(andel=Antal/Antal_totalt)%>%
+	select(-Antal_totalt,kod)%>%
+	ungroup()%>%
+	unique()%>%
+	select(Region, agegroup,Antal,andel)%>%
+	rename("Åldersgrupp"="agegroup","Antal vaccinerade"="Antal", "Andel vaccinerade"="andel")%>%
+	group_by(Region, Åldersgrupp)%>%
+	mutate(`Antal vaccinerade`=sum(`Antal vaccinerade`))%>%
+	ungroup()%>%
+	distinct(Region,Åldersgrupp,.keep_all=TRUE)
+
+
+
+
+#Vi stänger ner vårt connection-objekt:
+
+dbDisconnect(con)
+
+Åldersstatistik_1_2 <- read_excel("G:\\Projekt/Vaccinationsregister/Magnus H/Automatisering dashboard/Grunddata.xlsx", 
+    sheet = "Åldersstatistik dos 1 o 2 LÅST")
+
+kommun_dos_1_2 <- read_excel("G:\\Projekt/Vaccinationsregister/Magnus H/Automatisering dashboard/Grunddata.xlsx", 
+    sheet = "Kommun dos 1 och 2 LÅST")
+
+TOC <- read_excel("G:\\Projekt/Vaccinationsregister/Magnus H/Automatisering dashboard/Grunddata.xlsx", 
+    sheet = "Information DATUM")
+
+
+filename<-paste0("G:\\Projekt/Vaccinationsregister/Magnus H/Automatisering dashboard/\\Data covidvaccinationer leverans ",as.character(format(Sys.Date(), "%y%m%d")),".xlsx")
+
+
+original_file <- "G:\\Projekt\\Vaccinationsregister\\Magnus H\\Automatisering dashboard\\Grunddata.xlsx"
+
+file.copy(from = original_file, to = filename, overwrite = TRUE)
+
+# Create a new workbook
+wb <- loadWorkbook(filename)
+
+# Add worksheets to the workbook
+
+removeWorksheet(wb, "Nolldata")
+
+addWorksheet(wb, "Vaccinationer tidsserie")
+writeDataTable(wb, "Vaccinationer tidsserie", antal_vaccinationer, rowNames = FALSE, tableStyle = "TableStyleMedium3",keepNA=TRUE,na.string = ".")
+
+addWorksheet(wb, "Åldersstatistik dos 3")
+writeDataTable(wb, "Åldersstatistik dos 3", dos3_ålder, rowNames = FALSE, tableStyle = "TableStyleMedium3",keepNA=TRUE,na.string = ".")
+
+addWorksheet(wb, "Åldersstatistik aktuell påfylln")
+writeDataTable(wb, "Åldersstatistik aktuell påfylln", aktivdos_ålder, rowNames = FALSE, tableStyle = "TableStyleMedium3",keepNA=TRUE,na.string = ".")
+
+addWorksheet(wb, "Kommun dos 3")
+writeDataTable(wb, "Kommun dos 3", kommun_dos_3, rowNames = FALSE, tableStyle = "TableStyleMedium3",keepNA=TRUE,na.string = ".")
+
+addWorksheet(wb, "Kommun aktuell påfyllnad")
+writeDataTable(wb, "Kommun aktuell påfyllnad", kommun_aktiv_dos, rowNames = FALSE, tableStyle = "TableStyleMedium3",keepNA=TRUE,na.string = ".")
+
+worksheetOrder(wb) <- c(1,4,2,5,6,3,7,8)
+
+# Save workbook to disk
+saveWorkbook(wb, filename, overwrite = TRUE)
+
+
+#----------------------------
+#KOD TILL PX-FIL
+#Jag designade denna kod tidigare för att underlätta manuella inläsningen. Därav dubbelarbetet. 
+#----------------------------
+
+library(readxl)
+library(dplyr)
+library(tidyr)
+library(stringr)
+library(openxlsx)
+
+options(scipen=999)
+
+#Detta script läser in data för Dos1 och dos2 för covidvaccinet, och omvandlar den till samma format som datan för dos 3 och för aktuell dos. 
+
+#Import av flikarna
+
+alder12 <- Åldersstatistik_1_2
+
+kommun12 <- kommun_dos_1_2
+
+#Vi plockar fram alla unika kombinationer av län och länskod
+
+namn_nummer<-kommun12%>%
+	select(Län, Län_namn)%>%
+	unique()%>%
+	rename(Region=Län_namn)
+
+#Vi räknar ut antalet i totalbefolkningen som används eftersom andelen är lika med lillan/StoraN-
+#Ibland saknas antalet för Dos 1trots att andelen existerar. 
+#Vi använder i dessa fall antalet och andelen för dos 2 istället. 
+
+kommun12<-kommun12%>%
+	mutate(Stora_N=ifelse(
+		!is.na(`Antal minst 1 dos`),`Antal minst 1 dos`/`Andel minst 1 dos`,`Antal minst 2 doser`/`Andel minst 2 doser`))%>%
+	replace_na(list(`Antal minst 1 dos`=0,`Antal minst 2 doser`=0))
+
+#Vi räknar ut det totala antalet vaccinerade och den totala andelen vaccinerade per kommun
+
+kommun12<-kommun12%>%
+	group_by(Kommun)%>%
+	mutate(
+		antal_1=sum(`Antal minst 1 dos`), 
+		antal_2=sum(`Antal minst 2 doser`),
+		andel_1=antal_1/sum(Stora_N), 
+		andel_2=antal_2/sum(Stora_N))%>%
+	ungroup()
+
+#Vi skapar ett nytt dataset som bara innehåller antal/andel vaccinationer för alla åldersgrupper
+
+kommun12_tot<-kommun12%>%
+	select(-`Antal minst 1 dos`,-`Antal minst 2 doser`,-`Andel minst 1 dos`,-`Andel minst 2 doser`)
+
+
+
+kommun12_tot<-kommun12_tot%>%mutate(Ålder="Totalt 18+")%>%rename(`Antal minst 1 dos`=antal_1,
+                                                      `Antal minst 2 doser`=antal_2,
+                                                      `Andel minst 1 dos`=andel_1,
+                                                      `Andel minst 2 doser`=andel_2)
+kommun12<-kommun12%>%select(-andel_1,-andel_2, -antal_1,-antal_2)
+
+#Vi slår ihop totalerna med originaldatasetet
+ 
+kommun12<-union(kommun12, kommun12_tot)
+
+#Vi kommer nu behöva plocka fram de REGIONALA totalerna, som också de saknas. 
+#För att göra detta slår vi ihop med alder12. Innan vi gör det måste vi dock slå ihop
+#alder12 med en tolkingsnyckel, då det datsetet saknar länskoder
+
+alder12<-alder12%>%
+    full_join(namn_nummer,by="Region")%>%
+    mutate(Region=ifelse(Region=="| Sverige |", "Riket", Region))%>%
+    mutate(Län=ifelse(Region=="Riket", "00", Län))%>%
+    mutate(Region=paste0(Län, " ",Region))%>%
+    select(-Län)%>%
+    pivot_longer(c("Antal vaccinerade",
+			 "Andel vaccinerade"),
+			names_to = "Antal och andel",
+			 values_to = "Värde")%>%
+    mutate(Åldersgrupp=paste0(Åldersgrupp, " år"))
+
+kommun12<-kommun12%>%mutate(Region=paste0(Kommun," ",Kommun_namn))
+
+kommun12<-kommun12%>%
+    mutate(Region=paste0(Kommun, " ",Kommun_namn))%>%
+    rename(Åldersgrupp=Ålder)%>%pivot_longer(c(`Antal minst 1 dos`,
+                                               `Antal minst 2 doser`,
+                                               `Andel minst 1 dos`,
+                                               `Andel minst 2 doser`),
+                                             names_to = "Vaccinationsstatus",
+                                             values_to = "Värde")
+kommun12<-kommun12%>%
+    mutate(`Antal och andel`=ifelse(str_detect(Vaccinationsstatus,"^Antal.*"), "Antal vaccinerade","Andel vaccinerade"))%>%
+    mutate(Vaccinationsstatus=str_replace(Vaccinationsstatus,"^[A-Z][a-z]{4} ",""))%>%
+    mutate(Vaccinationsstatus=str_replace(Vaccinationsstatus,"^minst","Minst"))%>%
+    mutate(Åldersgrupp=paste0(Åldersgrupp, " år"))%>%
+    select(Region, Åldersgrupp, Vaccinationsstatus, `Antal och andel`, Värde)%>%
+    union(alder12)%>%
+    arrange(Region)%>%
+    mutate(Värde=ifelse(`Antal och andel`=="Andel vaccinerade", round(100*Värde,1),Värde))%>%
+    mutate(Åldersgrupp=ifelse(Åldersgrupp=="80+ år","80- år",ifelse(Åldersgrupp=="Totalt 18+ år","Totalt 18- år", Åldersgrupp)))
+
+
+#--------------------
+
+#I dessa dataset har vi redan en uträknad total för varje kommun (Totalt 18+), 
+#så detta behöver inte räknas ut manuellt
+
+#Vi kommer här mest slå ihop variabler till rätt format
+
+kommun_aktiv_dospx<-kommun_aktiv_dos%>%
+    mutate(Vaccinationsstatus="Aktuell påfyllnadsdos")%>%
+    pivot_longer(c("Antal vaccinerade",
+                   "Andel vaccinerade"),
+                 names_to = "Antal och andel",
+                 values_to = "Värde")%>%
+    mutate(Region=paste0(KnKod," ",KnNamn))%>%
+    select(-KnNamn, -KnKod)
+
+#Regionala och nationella totaler finns sparade i aktivdos_ålder.
+#Vi slår som tidigare ihop detta med regionkoder och döper om/
+#reshapear vissa variabler.
+
+aktivdos_alderpx<-aktivdos_ålder%>%
+	mutate(Vaccinationsstatus="Aktuell påfyllnadsdos")%>%
+	full_join(namn_nummer,by="Region")%>%
+    	mutate(Region=ifelse(Region=="| Sverige |", "Riket", Region))%>%
+    	mutate(Län=ifelse(Region=="Riket", "00", Län))%>%
+    	mutate(Region=paste0(Län, " ",Region))%>%
+    	select(-Län)%>%
+    	pivot_longer(c("Antal vaccinerade",
+			 "Andel vaccinerade"),
+			names_to = "Antal och andel",
+			 values_to = "Värde")
+
+aktiv_dos_alla_komlan<-kommun_aktiv_dospx%>%
+	bind_rows(aktivdos_alderpx)%>%
+	mutate(Åldersgrupp=paste0(Åldersgrupp," år"))%>%
+	mutate(Åldersgrupp=ifelse(Åldersgrupp=="80+ år","80- år",ifelse(Åldersgrupp=="Total 18+ år"|Åldersgrupp=="Totalt 18+ år","Totalt 18- år", Åldersgrupp)))%>%
+	mutate(Värde=ifelse(`Antal och andel`=="Andel vaccinerade", Värde*100,Värde))
+
+#Som tidigare, kommunala totaler är redan uträknade.
+
+kommun_dos3_px<-kommun_dos_3%>%
+	mutate(Vaccinationsstatus="Dos 3")%>%
+	pivot_longer(c("Antal vaccinerade",
+                   "Andel vaccinerade"),
+                 names_to = "Antal och andel",
+                 values_to = "Värde")%>%
+	mutate(Region=paste0(KnKod," ",KnNamn))%>%
+	select(-KnNamn, -KnKod)
+
+#Regionala och nationella totaler i dos3_ålder. Slås ihop med regionkoder
+
+dos3_ålderpx<-dos3_ålder%>%
+	mutate(Vaccinationsstatus="Dos 3")%>%
+	full_join(namn_nummer,by="Region")%>%
+    	mutate(Region=ifelse(Region=="| Sverige |", "Riket", Region))%>%
+    	mutate(Län=ifelse(Region=="Riket", "00", Län))%>%
+    	mutate(Region=paste0(Län, " ",Region))%>%
+    	select(-Län)%>%
+    	pivot_longer(c("Antal vaccinerade",
+			 "Andel vaccinerade"),
+			names_to = "Antal och andel",
+			 values_to = "Värde")
+
+#Regionala och nationella totaler slås ihop med siffor för enskilda kommuner
+
+dos3_alla_komlan<-kommun_dos3_px%>%
+	bind_rows(dos3_ålderpx)%>%
+	mutate(Åldersgrupp=paste0(Åldersgrupp," år"))%>%
+	mutate(Åldersgrupp=ifelse(Åldersgrupp=="80+ år","80- år",ifelse(Åldersgrupp=="Total 18+ år"|Åldersgrupp=="Totalt 18+ år","Totalt 18- år", Åldersgrupp)))%>%
+	mutate(Värde=ifelse(`Antal och andel`=="Andel vaccinerade", Värde*100,Värde))
+
+
+#Alla datset slås ihop
+
+#Vi ändrar ordningen så att ålderstotalerna redovisas först och regionerna alltid redovisas innan kommunerna. 
+#För ålderstotalerna gör vi detta genom att definiera factor levels. För regioner/kommuner skapar vi en 
+#ny ordningsvariabel som vi droppar efter att ha sorterat efter den.
+
+alla_dashboard_px<-kommun12%>%
+	bind_rows(dos3_alla_komlan,aktiv_dos_alla_komlan)%>%
+	mutate(År=year(Sys.Date()))%>%
+	relocate(Värde, .after = last_col())%>%	
+	mutate(Åldersgrupp=factor(Åldersgrupp,levels=c("Totalt 18- år","18-49 år","50-64 år","65-79 år","80- år")),
+		Vaccinationsstatus=factor(Vaccinationsstatus, levels=c("Minst 1 dos","Minst 2 doser","Dos 3","Aktuell påfyllnadsdos")))%>%
+	mutate(order_column_region=str_replace(Region,"^([0-9]*).*","\\1"))%>%	
+	mutate(order_column_region=ifelse(str_detect(order_column_region,"^[0-9]{2}$"),str_replace(order_column_region,"^([0-9]{2})","00\\1"),order_column_region))%>%
+	arrange(År, Vaccinationsstatus, order_column_region, Åldersgrupp)%>%
+	select(-order_column_region)%>%
+	mutate(Värde=round(Värde,1)))
+
+write.table(as.data.frame(alla_dashboard_px),file="G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_dashboard\\covvaccregaktuell.csv", 
+            row.names = FALSE,col.names=TRUE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+
+# Nedanstående ska förhoppningsvis installera saknade paket automatiskt.
+if(length(c("dplyr", "readr", "tidyr")[c("dplyr", "readr", "tidyr") %in% installed.packages()[,"Package"]])<3){install.packages("dplyr", "readr", "tidyr")}
+
+#install.packages("dplyr","readr","tidyr")
+library(dplyr)
+library(readr)
+library(tidyr)
+
+
+#Skapar fillista dataset
+# Vi läster först in alla datset i in-mappen till "fillista", och från den listan namnet på alla relaterade
+# rubriker, ini-filer, headers-filer och pivoteringsviller till "fillista_rensad". 
+
+fillista<-list.files("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_dashboard")
+fillista_rensad<-gsub("_[0-9]{8}.csv","",fillista)
+fillista_rensad<-gsub(".csv","",fillista_rensad)
+
+#Skapar en vektor för våra TIMEVAL-variabler, som kommer uppdateras
+#för varje steg i loopen. 
+
+TIMEVAL_VECTOR<-c()
+
+#Vi startar vår for-loop:
+
+for(i in seq_along(fillista)){
+    
+#Läser in datafiler och kontrollfiler
+
+df2 <- read_delim(paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_dashboard\\",fillista[i]), 
+                      delim = ";", escape_double = FALSE, locale = locale(encoding = "windows-1252"), 
+                      trim_ws = TRUE)
+    
+    full_control <- read_delim(paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob/kontrollfiler dashboard\\",fillista_rensad[i],".csv"), 
+                               delim = ";", escape_double = FALSE, col_names = FALSE, 
+                               locale = locale(encoding = "windows-1252"), 
+                               trim_ws = TRUE)
+
+#Döper om variabelnamnen här istället för grovstädningsscriptet så slipper vi störa pivoteringsordningen.....
+
+if("kön" %in% names(df2)){df2<-df2%>%rename(Kön=kön)}
+if("region" %in% names(df2)){df2<-df2%>%rename(Region=region)}
+if("kod_Region" %in% names(df2)){df2<-df2%>%rename(Region=kod_Region)}
+if("kod_region" %in% names(df2)){df2<-df2%>%rename(Region=kod_region)}
+if("veckonummer" %in% names(df2)){df2<-df2%>%rename(Vecka=veckonummer)}
+if("ålder" %in% names(df2)){df2<-df2%>%rename(Åldersgrupp=ålder)}
+if("säsong" %in% names(df2)){df2<-df2%>%rename(År=säsong)}
+
+names(full_control)<-c("first","second","third", "fourth", "fifth", "sixth","seventh", "eighth", "ninth" )
+
+#Noterar tidsvariabel
+    
+tidsvariabel<-full_control%>%filter(first=="variablename")%>%select(third)
+tidsvariabel<-tidsvariabel$third
+tidsvariabel<-df2%>%pull(tidsvariabel)
+tidsvariabel<-tidsvariabel[!is.na(tidsvariabel)]
+
+#Lägger till obligatoriska fält. 
+
+#Lägger till REFPERIOD i KONTROLLFILEN med värden från datafil
+    
+full_control<-full_control%>%
+    mutate(second=ifelse(first=="LAST-UPDATED", as.character(format(Sys.time(),"%Y%m%d %H:%M")),ifelse(first=="REFPERIOD",paste0(min(tidsvariabel)," - ", max(tidsvariabel)),second)))
+    
+    TIMEVAL<-ifelse(sum(full_control$first=="TIMEVAL" & !is.na(full_control$third))>0," !T","")
+    TIMEVAL_VECTOR<-c(TIMEVAL_VECTOR,TIMEVAL)
+    
+#Bearbetar datafilen
+
+if("Dag" %in% names(df2)){df2$Dag<-as.character(df2$Dag)}
+
+if("Datum" %in% names(df2)){df2$Datum<-as.character(df2$Datum)}
+    
+    
+    #Läser in rubrik och pivoteringskolumn från kontrollfil
+    
+    tabellrubrik<-full_control%>%filter(first=="TITLE")%>%select(second)
+    
+    stub<-full_control%>%filter(first=="STUB")%>%select(second)
+    stub<-as.matrix(stub)[,]
+    
+    headings<-full_control%>%filter(first=="HEADING")%>%select(second)
+    headings<-as.matrix(headings)[,]
+    
+    pivot_rad_kolumn<-trimws(paste0(stub,",",headings))
+    pivot_rad_kolumn<-strsplit(pivot_rad_kolumn,",")[[1]]
+    Indikatorsrubriker<-names(df2)[!names(df2) %in% pivot_rad_kolumn]
+ 
+#if(length(names(df2))>3 & !"Indikator" %in% names(df2) & !"value" %in% names(df2)){
+#    df2<-pivot_longer(df2,cols=all_of(Indikatorsrubriker),names_to="Indikator")}
+
+if("value" %in% names(df2)){
+df2<-df2%>%select(-value,everything())}
+
+#Nu lägger vi till våra CODES-värden. Detta villkorar vi med namnen på tabellen, eftersom samma variabel kan ha olika codes i olika dataset.
+
+df2<-df2%>%mutate(ID_variabel=fillista[i])
+
+if(unique(df2$ID_variabel) %in% c("covvaccregaktuell.csv")){
+
+df2<-df2%>%
+	mutate(Region2=str_replace(Region,"^([0-9]+).*$","\\1"),
+		Åldersgrupp2=ifelse(
+			Åldersgrupp=="Totalt 18- år",0,ifelse(
+			Åldersgrupp=="18-49 år",1,ifelse(
+			Åldersgrupp=="50-64 år",2,ifelse(
+			Åldersgrupp=="65-79 år",3,ifelse(
+			Åldersgrupp=="80- år",4,99))))),
+		Vaccinationsstatus2=ifelse(
+			Vaccinationsstatus=="Minst 1 dos",1,ifelse(
+			Vaccinationsstatus=="Minst 2 doser",2,ifelse(
+			Vaccinationsstatus=="Dos 3",3,ifelse(
+			Vaccinationsstatus=="Aktuell påfyllnadsdos",4,99)))),
+		`Antal och andel2`=ifelse(
+			`Antal och andel`=="Antal vaccinerade",1,ifelse(
+			`Antal och andel`=="Andel vaccinerade",2,99)))%>%
+    	relocate(Region2, Region)%>%
+	relocate(Åldersgrupp2,Åldersgrupp)%>%
+	relocate(Vaccinationsstatus2,Vaccinationsstatus)%>%
+	relocate(`Antal och andel2`,`Antal och andel`)}
+
+if("Vaccin" %in% names(df2) & unique(df2$ID_variabel) %in% c("vacHPV.csv")){df2<-df2%>%mutate(Vaccin2=ifelse(
+		Vaccin=="HPV flickor, minst 1 dos", "1",ifelse(
+		Vaccin=="HPV flickor, minst 2 doser","11",ifelse(
+		Vaccin=="HPV pojkar, minst 1 dos", "2", ifelse(
+		Vaccin=="HPV pojkar, minst 2 doser","22","99")))))%>%
+	relocate(Vaccin2, Vaccin)}
+
+if("År" %in% names(df2)){df2<-df2%>%
+	mutate(År2=År)%>%
+	relocate(År2, År)}
+
+if("Födelseår" %in% names(df2)){df2<-df2%>%
+	mutate(Födelseår2=Födelseår)%>%
+	relocate(Födelseår2, Födelseår)}
+
+df2<-df2%>%select(-ID_variabel)
+
+
+
+
+    df2<- rbind(c(tabellrubrik$second, rep(NA, ncol(df2) - 1)), names(df2), df2)
+
+    df2<-t(as.matrix(df2))
+    df2<-as.data.frame(df2)%>%mutate(V2=str_replace(V2,"(.*)2","\\1"),V2)
+    df2<-as.data.frame(t(as.matrix(df2)))
+
+
+    
+    #Exporterar som vanligt
+    
+    write.table(as.data.frame(df2),file=
+                    paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers\\",fillista[i]), 
+                row.names = FALSE,col.names=FALSE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+    
+    write.table(full_control,
+                file=paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\kontrollfiler2\\",fillista_rensad[i],".csv"),
+                row.names = FALSE,col.names=FALSE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+}
+
+
+
+#För körning i kommanmdotolken 
+#Vi skapar en lång kodrad med rätt kod för att köra pxjob i kommandotolken
+#och skapa px-filer från våra datset och våra kontrollfiler.
+
+cmd<-gsub("\\n","",paste0("cd /D C:\\Program Files (x86)\\PX-Edit 2019 ver 4.0 && ",paste0("Pxjob job=px path=\"G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\" in=\"\\In_headers\\",fillista,"\" 
+out=\"\\Out dashboard\" meta=\"\\kontrollfiler2\\",fillista_rensad,".csv\" log=\"\\log\\log.txt\"", TIMEVAL_VECTOR, collapse=" && ")))
+
+#Vi sparar detta som en extern fil (denna kan behöva raderas om den inte uppdateras).
+
+fileConn<-file("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\Script\\output.txt")
+writeLines(c(cmd), fileConn)
+close(fileConn)
+

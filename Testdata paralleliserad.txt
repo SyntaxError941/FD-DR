@@ -1,0 +1,647 @@
+library(dplyr)
+library(tidyr)
+library(readxl)
+library(stringr)
+library(janitor)
+library(ISOweek)
+library(lubridate)
+library(foreach)
+library(doParallel)
+library(parallel)
+
+#Läser in filer för testdata, uppdelat på Indikator, kön, ålder och år/vecka
+
+#Vi kommer att läsa in de olika filerna och stacka dem (outer union på SQL-språk)
+#Om vi har dubbletter så kommer vi låta mest aktuella datumet få företräde.
+
+
+#Vi skapar en tom lista som våra inlästa dataset kan läggas till i.
+
+lista_dataset<-list()
+
+#Vi skapar en lista över alla filer som ligger i mappen och som ska slås ihop
+
+fillista<-list.files("G:/Data/Folkhälsodata/_3b px-filer (arbetsmaterial2023)/Filer för Pxjob/In_veckokörningar_covidtest/Total/Historisk data (uppdatera varje år)")
+
+list_100k<-list.files("G:/Data/Folkhälsodata/_3b px-filer (arbetsmaterial2023)/Filer för Pxjob/In_veckokörningar_covidtest/Per 100 000")
+
+list_100k_filtered<-list_100k[!grepl("^~\\$", list_100k)]
+
+
+numcores<-detectCores()
+
+registerDoParallel(numcores)
+
+#Vi läser in alla filer och skapar en ID-variabel med värde motsvarande dess filnamn.
+#Denna variabel använder vi sedan för att avgöra vilken fil som är mest aktuell,
+#detta då datum står med i filnamnet.
+
+#OBSERVERA att detta tillvägagångssätt medför en risk för missade veckor osv.
+#Rekommenderar starkt att vi istället tar en fil per år, alternativt läser in
+#allt från dabasen direkt. 
+
+#OBSERVERA även att sorteringen bygger på filnamnet och att detta medför risker.
+#Ett filnamn som slutar på v4 kommer sorteras senare än något som slutar på v37, 
+#vilket kommer medföra felaktig sortering och att fel värden får företräde.  
+
+lista_dataset<-foreach(i=seq_along(fillista), .packages = c("readxl", "dplyr", "tidyr", "stringr", "janitor", "ISOweek", "lubridate")) %dopar% {
+
+akt_test_10<- read_excel(paste0("G:/Data/Folkhälsodata/_3b px-filer (arbetsmaterial2023)/Filer för Pxjob/In_veckokörningar_covidtest/Total/Historisk data (uppdatera varje år)/",fillista[i]))
+
+akt_test_10<-akt_test_10%>%mutate(ID_kolumn=fillista[i])}
+
+    
+stopImplicitCluster()
+
+#   user    system  elapsed 
+#   0.21    0.13    15.76 
+
+#Vi stackar datseten
+
+dataset_stackade<-bind_rows(lista_dataset)
+
+#Om vi har flera värden per undergrupp har vi läst in 
+#överlappande rader från våra källfiler. I sådana fall
+#ger vi prioritet åt den med senast information (diskuterat detta med Hatef).
+
+#Observera att ID_kolumnen bygger på filnamnet, och att funktionen 
+#förutsätter korrekt kronologisk sortering 
+
+#Sista raden ser till att vi bara har med veckor som 
+#faktiskt ska ingå i det året enligt ISO 8601. Enligt denna
+#konvention börjar vecka 1 för nästakommande år den 29 december.
+
+dataset_stackade_filtrering<-dataset_stackade%>%
+    group_by(År, Vecka, Region, Åldersgrupp, Kön)%>%
+    arrange(rank(ID_kolumn))%>%
+    mutate(ordningsnummer=row_number())%>%
+    filter(ordningsnummer==max(ordningsnummer))%>%
+    ungroup()%>%
+    filter(Vecka<=lubridate::isoweek(sprintf("%d-12-28", År)))
+
+#Vi lägger till en nolla för att konvertera värden som "Vecka 7" till "Vecka 07"
+#Vi imputerar dett datum för varje vecka. Vi sätter detta till torsdag då 
+#varje vecka måste innehålla minst en torsdag enligt ISO 8601
+
+dataset_stackade_filtrering<-dataset_stackade_filtrering%>%
+    mutate(Vecka=as.character(Vecka))%>%
+    mutate(Vecka=ifelse(str_detect(Vecka,"^[0-9]{1}$"),paste0("0",Vecka),Vecka))%>%
+    mutate(datum=ISOweek2date(paste0(as.character(År),"-W",Vecka,"-4")))
+
+#Vi verkar filtrera efter ID_kolumn igen, fast nu efter datum? 
+#Kommer ej ihåg anledning.
+
+max_datum<-dataset_stackade_filtrering%>%
+	filter(rank(ID_kolumn)==max(rank(ID_kolumn)))%>%
+	filter(datum==max(datum))%>%
+	select(datum)%>%
+	unique()
+
+dataset_stackade_filtrering<-dataset_stackade_filtrering%>%
+    filter(datum<=max_datum$datum)
+
+# user  system elapsed 
+# 13.22    0.32   15.58 
+
+#vektor att iterara for-loopen över.
+
+vektor_till_loop<-c(1:4)
+
+#Från datastet dataset_stackade_filtrering
+#Skapar vi två olika dataset, ett med år och vecka
+#som olika variabler, ett med år och vecka i en sammanskriven variabel.
+#för px-filerna "PCRtestVAr" respektive "PCRtest"
+
+#I huvudsak kommer vi döpa om olika variabler/variabelvärden,
+#ta bort onödig variabler och pivotera till long format.
+
+
+testdata_paralelliserad<-function(i){
+if(i==1){
+alla_test_tot_arvecka<-dataset_stackade_filtrering%>%
+    #mutate(Vecka=as.character(Vecka))%>%
+    #mutate(Vecka=ifelse(str_detect(Vecka,"^[0-9]{1}$"),paste0("0",Vecka),Vecka))%>%
+    mutate(datum=ISOweek2date(paste0(as.character(År),"-W",Vecka,"-4")))%>%
+    mutate(`År och Vecka`=paste0(År," V ",Vecka))%>%
+    mutate(Åldersgrupp=ifelse(
+        Åldersgrupp=="Total", "Alla åldrar", ifelse(
+            Åldersgrupp=="0-19"|Åldersgrupp=="20-69",paste0(Åldersgrupp, " ","år"),ifelse(
+                Åldersgrupp=="70plus","70- år och äldre", ifelse(
+                    Åldersgrupp=="Övriga", "Uppgift om ålder saknas", Åldersgrupp    
+                )))),
+        Kön=ifelse(Kön=="Kvinna", "Kvinnor", ifelse(Kön=="Man","Män",ifelse(Kön=="Alla", "Totalt", ifelse(Kön=="Okänt", "Uppgift om kön saknas", Kön)))))%>%
+    mutate(kod_Region=paste0(kod, " ", Region))%>%
+    filter(datum>=as.Date("2020-10-01"))%>%
+    select(-År,-Vecka, -kod,-Region, -datum, -ordningsnummer, -ID_kolumn)%>%
+    rename("Antal testade"="Total",
+           "Antal positiva"="Positiva", 
+           "Antal negativa"="Negativa",
+           "Andel positiva"="Procent Positiva")%>%
+    pivot_longer(3:7, names_to="Indikator")%>%
+	arrange(`År och Vecka`)
+
+write.table(as.data.frame(alla_test_tot_arvecka),file="G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_veckokörningar\\PCRtestVAr.csv", 
+            row.names = FALSE,col.names=TRUE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+
+} else if(i==2){
+
+alla_test_tot_ar_vecka<-dataset_stackade_filtrering%>%
+	#mutate(Vecka=as.character(Vecka))%>%
+	#mutate(Vecka=ifelse(str_detect(Vecka,"^[0-9]{1}$"),paste0("0",Vecka),Vecka))%>%
+	mutate(Vecka=paste0("V ",Vecka))%>%
+    mutate(Åldersgrupp=ifelse(
+               Åldersgrupp=="Total", "Alla åldrar", ifelse(
+                Åldersgrupp=="0-19"|Åldersgrupp=="20-69",paste0(Åldersgrupp, " ","år"),ifelse(
+                Åldersgrupp=="70plus","70- år och äldre", ifelse(
+                Åldersgrupp=="Övriga", "Uppgift om ålder saknas", Åldersgrupp    
+                )))),
+           Kön=ifelse(Kön=="Kvinna", "Kvinnor", ifelse(Kön=="Man","Män",ifelse(Kön=="Alla", "Totalt", ifelse(Kön=="Okänt", "Uppgift om kön saknas", Kön)))))%>%
+    mutate(kod_Region=paste0(kod, " ", Region))%>%
+    select(-kod,-Region, -ordningsnummer, -ID_kolumn,-datum)%>%
+    rename("Antal testade"="Total",
+           "Antal positiva"="Positiva", 
+           "Antal negativa"="Negativa",
+           "Andel positiva"="Procent Positiva")%>%
+    pivot_longer(5:9, names_to="Indikator")
+
+write.table(as.data.frame(alla_test_tot_ar_vecka),file="G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_veckokörningar\\PCRtest.csv", 
+            row.names = FALSE,col.names=TRUE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+
+
+
+} else if(i==3){
+
+
+#Läser in data per 100 000
+
+test_per_100k<- read_excel(paste0("G:/Data/Folkhälsodata/_3b px-filer (arbetsmaterial2023)/Filer för Pxjob/In_veckokörningar_covidtest/Per 100 000/",list_100k_filtered[1]), 
+    sheet = "TestIndiv per 100 000 sorterade", 
+    col_names = FALSE, skip = 1)
+
+
+#Vi blir tvungna att omvandla rader till kolumner för att bearbeta veckorna. 
+#Någon har kodat en av veckorna till "v 1 2023" för en av värdena. Första raden filterar bort det
+#och alla liknande värden, och hämtar bara veckonumret. Dessutom justera vi för människor som 
+#skrivit sina veckor inkonsekvent, det vill säga både med och utan mellanslag.
+
+#Eftersom ingen behagat tanka ner info om år får vi räkna ut detta retroaktivt. 
+#Då tidsserien börjar med 2020 sätter vi detta som basår. Eftersom datsetet är sorterat på datum, 
+#vet vi också att observationer länge till höger kommer att representera senare datum. I det transponerade
+#datsetet bevaras denna ordning, bara det att senare datum nu visas längre ner. Detta tillåter oss att
+#räkna ut aktuellt år genom att inkrementera årtalet med ett varje gång veckonumret är lika med 1. 
+
+#Känner viss stolthet över ovanstående workaround men undrar samtidigt om Dm inte bara kan ge oss
+#vettiga uppgifter att arbeta med. 
+
+test_per_100k<-as.data.frame(t(as.matrix(test_per_100k)))
+
+test_per_100k<-test_per_100k%>%
+	mutate(V1=str_replace(V1,"^(v[0-9]*) .*$","\\1"))%>%    
+	mutate(V1=str_replace(V1,"^v([0-9]*)$","v \\1"))%>%
+	mutate(V1=str_replace(V1,"^v ([0-9])$","v 0\\1" ))%>%
+	mutate(År=ifelse(str_detect(V1, "^v.*$"), 2020,NA), additional=cumsum(ifelse(V1=="v 01",1,0)))%>%
+	mutate(År=as.character(År+additional))%>%
+	mutate(År=replace_na(År,""))%>%
+	mutate(V1=trimws(paste0(År," ",V1)))%>%
+	select(-År, -additional)
+
+test_per_100k<-as.data.frame(t(as.matrix(test_per_100k)))
+
+#Sätter första raden som rubriker
+
+test_per_100k<-test_per_100k%>%
+	row_to_names(row_number=1)%>%
+	pivot_longer(3:ncol(test_per_100k),names_to = "Vecka")%>%
+	mutate(kod_region=paste0(kod, " ", klartext))%>%
+	select(-kod,-klartext)
+
+write.table(as.data.frame(test_per_100k),file="G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_veckokörningar\\Test100VAr.csv", 
+            row.names = FALSE,col.names=TRUE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+
+} else if(i==4){
+
+#Läser in antal tester per vecka_år och region
+
+Antaltest_region <- read_excel(paste0("G:/Data/Folkhälsodata/_3b px-filer (arbetsmaterial2023)/Filer för Pxjob/In_veckokörningar_covidtest/Per 100 000/",list_100k_filtered[1]), 
+    sheet = "Antal tester sorterade på kod", 
+    col_names = FALSE, skip = 1)
+
+Antaltest_region<-as.data.frame(t(as.matrix(Antaltest_region)))
+
+Antaltest_region<-Antaltest_region%>%
+    mutate(V1=str_replace(V1,"^(v) ([0-9]+).*$","\\1\\2"))
+
+#Samma logik som tidigare vad gäller veckor och årtalet.
+
+
+Antaltest_region<-Antaltest_region%>%
+    mutate(V1=str_replace(V1,"^(v) ([0-9]+).*$","\\1\\2"))%>%
+    mutate(V1=str_replace(V1,"^(v[0-9]*) .*$","\\1"))%>%     
+    mutate(V1=str_replace(V1,"^v([0-9]*)$","v \\1"))%>%
+    mutate(V1=str_replace(V1,"^v ([0-9])$","v 0\\1" ))%>%
+    mutate(År=ifelse(str_detect(V1, "^v.*$"), 2020,NA), additional=cumsum(ifelse(V1=="v 01",1,0)))%>%
+    mutate(År=as.character(År+additional))%>%
+    mutate(År=replace_na(År,""))%>%
+    mutate(V1=trimws(paste0(År," ",V1)))%>%
+    select(-År, -additional)
+
+Antaltest_region<-as.data.frame(t(as.matrix(Antaltest_region)))
+
+Antaltest_region<-Antaltest_region%>%
+	row_to_names(row_number=1)%>%
+	pivot_longer(3:ncol(Antaltest_region),names_to = "Vecka")%>%
+	mutate(kod_region=paste0(kod, " ", klartext))%>%
+	select(-kod,-klartext)
+
+write.table(as.data.frame(Antaltest_region),file="G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_veckokörningar\\TottestVAr.csv", 
+            row.names = FALSE,col.names=TRUE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+}}
+
+numcores<-detectCores()
+
+registerDoParallel(numcores)
+
+foreach(i=vektor_till_loop, .packages = c("readxl", "dplyr", "tidyr", "stringr", "janitor", "ISOweek", "lubridate")) %dopar% {testdata_paralelliserad(i)} 
+
+stopImplicitCluster()
+
+# user  system elapsed 
+# 13.82    0.31  108.10 
+
+library(dplyr)
+library(readr)
+library(tidyr)
+
+
+#Skapar fillista dataset
+# Vi läster först in alla datset i in-mappen till "fillista", och från den listan namnet på alla relaterade
+# rubriker, ini-filer, headers-filer och pivoteringsviller till "fillista_rensad". 
+
+fillista<-list.files("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_veckokörningar")
+fillista_rensad<-gsub("_[0-9]{8}.csv","",fillista)
+fillista_rensad<-gsub(".csv","",fillista_rensad)
+
+#Skapar en vektor för våra TIMEVAL-variabler, som kommer uppdateras
+#för varje steg i loopen. 
+
+TIMEVAL_VECTOR<-c()
+
+#Vi startar vår for-loop:
+
+numcores<-detectCores()
+
+registerDoParallel(numcores)
+
+foreach(i=seq_along(fillista), .packages = c("dplyr", "readr", "tidyr","stringr")) %dopar% {
+
+
+    
+#Läser in datafiler och kontrollfiler
+
+df2 <- read_delim(paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_veckokörningar\\",fillista[i]), 
+                      delim = ";", escape_double = FALSE, locale = locale(encoding = "windows-1252"), 
+                      trim_ws = TRUE)
+    
+    full_control <- read_delim(paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob/kontrollfiler veckokörningar\\",fillista_rensad[i],".csv"), 
+                               delim = ";", escape_double = FALSE, col_names = FALSE, 
+                               locale = locale(encoding = "windows-1252"), 
+                               trim_ws = TRUE)
+
+#Döper om variabelnamnen här istället för grovstädningsscriptet så slipper vi störa pivoteringsordningen.....
+
+if("kön" %in% names(df2)){df2<-df2%>%rename(Kön=kön)}
+if("region" %in% names(df2)){df2<-df2%>%rename(Region=region)}
+if("kod_Region" %in% names(df2)){df2<-df2%>%rename(Region=kod_Region)}
+if("kod_region" %in% names(df2)){df2<-df2%>%rename(Region=kod_region)}
+if("veckonummer" %in% names(df2)){df2<-df2%>%rename(Vecka=veckonummer)}
+if("ålder" %in% names(df2)){df2<-df2%>%rename(Åldersgrupp=ålder)}
+if("säsong" %in% names(df2)){df2<-df2%>%rename(År=säsong)}
+
+names(full_control)<-c("first","second","third", "fourth", "fifth", "sixth","seventh", "eighth", "ninth" )
+
+#Noterar tidsvariabel
+    
+tidsvariabel<-full_control%>%filter(first=="variablename")%>%select(third)
+tidsvariabel<-tidsvariabel$third
+tidsvariabel<-df2%>%pull(tidsvariabel)
+#Lägger till obligatoriska fält. 
+    
+full_control<-full_control%>%
+    mutate(second=ifelse(first=="LAST-UPDATED", as.character(format(Sys.time(),"%Y%m%d %H:%M")),ifelse(first=="REFPERIOD",paste0(min(tidsvariabel)," - ", max(tidsvariabel)),second)))
+    
+    TIMEVAL<-ifelse(sum(full_control$first=="TIMEVAL" & !is.na(full_control$third))>0," !T","")
+    TIMEVAL_VECTOR<-c(TIMEVAL_VECTOR,TIMEVAL)
+    
+#Bearbetar datafilen
+
+if("Dag" %in% names(df2)){df2$Dag<-as.character(df2$Dag)}
+
+if("Datum" %in% names(df2)){df2$Datum<-as.character(df2$Datum)}
+    
+    
+    #Läser in rubrik och pivoteringskolumn från kontrollfil
+    
+    tabellrubrik<-full_control%>%filter(first=="TITLE")%>%select(second)
+    
+    stub<-full_control%>%filter(first=="STUB")%>%select(second)
+    stub<-as.matrix(stub)[,]
+    
+    headings<-full_control%>%filter(first=="HEADING")%>%select(second)
+    headings<-as.matrix(headings)[,]
+    
+    pivot_rad_kolumn<-trimws(paste0(stub,",",headings))
+    pivot_rad_kolumn<-strsplit(pivot_rad_kolumn,",")[[1]]
+    Indikatorsrubriker<-names(df2)[!names(df2) %in% pivot_rad_kolumn]
+ 
+if(length(names(df2))>3 & !"Indikator" %in% names(df2)){
+    df2<-pivot_longer(df2,cols=all_of(Indikatorsrubriker),names_to="Indikator")}
+
+if("value" %in% names(df2)){
+df2<-df2%>%select(-value,everything())}
+
+#Nu lägger vi till våra CODES-värden. Detta villkorar vi med namnen på tabellen, eftersom samma variabel kan ha olika codes i olika dataset.
+
+df2<-df2%>%mutate(ID_variabel=fillista[i])
+
+
+#Lägger till REFPERIOD i KONTROLLFILEN med värden från datafil
+if("Region" %in% names(df2)){df2<-df2%>%
+mutate(Region=ifelse(
+	Region=="Jämtland_Härjedalen", "Jämtland",ifelse(
+	Region=="Sörmland","Södermanland",ifelse(
+	Region=="Västra_Götaland","Västra Götaland",ifelse(
+	Region=="Jämtland Härjedalen", "Jämtland", Region)))))%>%
+mutate(Region2=ifelse(
+	Region=="Riket","00",ifelse(
+	Region=="Blekinge","10", ifelse(
+	Region=="Dalarna", "20", ifelse(
+	Region=="Gotland","09",ifelse(
+	Region=="Gävleborg","21",ifelse(
+	Region=="Halland","13",ifelse(
+	Region=="Jämtland","23",ifelse(
+	Region=="Jönköping","06",ifelse(
+	Region=="Kalmar","08",ifelse(
+	Region=="Kronoberg","07",ifelse(
+	Region=="Norrbotten","25",ifelse(
+	Region=="Skåne","12", ifelse(
+	Region=="Stockholm","01",ifelse(
+	Region=="Södermanland","04", ifelse(
+	Region=="Uppsala","03",ifelse(
+	Region=="Värmland", "17", ifelse(
+	Region=="Västerbotten", "24", ifelse(
+	Region=="Västernorrland","22",ifelse(
+	Region=="Västmanland","19",ifelse(
+	Region=="Västra Götaland","14",ifelse(
+	Region=="Örebro","18",ifelse(
+	Region=="Östergötland","05","99")))))))))))))))))))))))%>%relocate(Region2, Region)}
+
+
+
+if("Region" %in% names(df2) & unique(df2$ID_variabel) %in% c("PCRtest.csv", "PCRtestVAr.csv",
+"Test100VAr.csv", "TottestVAr.csv" )){df2<-df2%>%
+#Detta värde är felkodat i vissa tabeller:
+    mutate(Region=ifelse(Region=="06 Kronoberg","07 Kronoberg",Region))%>%
+    mutate(Region2=str_replace(Region,"^([0-9]{2}).*$","\\1"))%>%
+	relocate(Region2, Region)}
+
+if("Statistikdatum" %in% names(df2)){df2<-df2%>%
+mutate("Dag2"=Statistikdatum)%>%
+relocate(Dag2,Statistikdatum)}
+
+if("Datum" %in% names(df2)){df2<-df2%>%
+mutate("Datum2"=Datum)%>%
+relocate(Datum2,Datum)}
+
+if("Kommun" %in% names(df2)){df2<-df2%>%
+mutate(kommun2=str_replace(Kommun,"^([0-9]+).*","\\1"))%>%
+relocate(kommun2,Kommun)}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel)=="bcov19Kom.csv"){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="Antal fall per vecka", 1, ifelse(
+            Indikator=="Antal fall per 10 000 inv",2,99)))%>%
+        relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel)=="ccov19kon.csv"){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="Antal fall", 1, ifelse(
+            Indikator=="Antal fall per 100 000 inv",2,99)))%>%
+            relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & (unique(df2$ID_variabel)=="ccov19Reg.csv")){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="Antal Fall", 1, ifelse(
+        Indikator=="Antal fall per 100 000 inv",11,ifelse(
+	Indikator=="Antal intensivvårdade fall",2,ifelse(
+	Indikator=="Antal intensivvårdade fall per 100 000 inv",21,ifelse(
+	Indikator=="Antal avlidna",3,ifelse(
+	Indikator=="Antal avlidna per 100 000 inv",31,99)))))))%>%
+            relocate(Indikator2,Indikator)
+}
+
+
+if("Indikator" %in% names(df2) & (unique(df2$ID_variabel)=="ccov19Regsasong.csv")){
+    df2<-df2%>%
+	mutate(Indikator=ifelse(
+		Indikator=="Antal_fall_vecka", "Antal Fall", ifelse(
+		Indikator=="Antal_fall_100000inv_vecka", "Antal fall per 100 000 inv", ifelse(
+		Indikator=="Antal_intensivvårdade_vecka","Antal intensivvårdade fall", ifelse(
+		Indikator=="Antal_iva_100000inv_vecka", "Antal intensivvårdade fall per 100 000 inv", ifelse(
+		Indikator=="Antal_avlidna_vecka", "Antal avlidna", ifelse(
+		Indikator=="Antal_avlidna_100000inv_vecka", "Antal avlidna per 100 000 inv", Indikator)))))))%>%
+	mutate(Indikator2=ifelse(
+        Indikator=="Antal Fall", 1, ifelse(
+        Indikator=="Antal fall per 100 000 inv",11,ifelse(
+	Indikator=="Antal intensivvårdade fall",2,ifelse(
+	Indikator=="Antal intensivvårdade fall per 100 000 inv",21,ifelse(
+	Indikator=="Antal avlidna",3,ifelse(
+	Indikator=="Antal avlidna per 100 000 inv",31,99)))))))%>%
+            relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel)=="dcov19ald.csv"){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="Antal Fall", 1, ifelse(
+            Indikator=="Antal fall per 100 000 inv",2,99)))%>%
+            relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel)=="ecov19sabo.csv"){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="SÄBO", 1, ifelse(
+            Indikator=="Hemtjänst",2,99)))%>%
+            relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel)=="ecov19sabosasong.csv"){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="SÄBO", 1, ifelse(
+            Indikator=="Hemtjänst",2,99)))%>%
+            relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel)=="xcov19ivavDAG.csv"){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="Antal intensivvårdade fall", 1, ifelse(
+            Indikator=="Antal avlidna fall",2,99)))%>%
+            relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel)=="ycov19ivavald.csv"){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="Antal intensivvårdade fall", 1, ifelse(
+        Indikator=="Antal intensivvårdade per 100 000 inv",2,ifelse(
+	Indikator=="Antal avlidna fall",3, ifelse(
+	Indikator=="Antal avlidna per 100 000 inv",4,99)))))%>%
+            relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel)=="ycov19ivavkon.csv"){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="Antal intensivvårdade fall", 3, ifelse(
+        Indikator=="Antal intensivvårdade per 100 000 inv",4,ifelse(
+	Indikator=="Antal avlidna fall",1, ifelse(
+	Indikator=="Antal avlidna per 100 000 inv",2,99)))))%>%
+            relocate(Indikator2,Indikator)
+}
+
+if("Indikator" %in% names(df2) & unique(df2$ID_variabel) %in% c("PCRtest.csv","PCRtestVAr.csv")){
+    df2<-df2%>%mutate(Indikator2=ifelse(
+        Indikator=="Antal testade", 0, ifelse(
+            Indikator=="Antal positiva",1,ifelse(
+                Indikator=="Andel positiva",2, ifelse(
+                    Indikator=="Antal negativa",3,ifelse(
+                        Indikator=="Ej Bedömbara",4,99))))))%>%
+        relocate(Indikator2,Indikator)
+}
+
+
+
+if("År" %in% names(df2)){
+    df2<-df2%>%
+	mutate(År2=År)%>%
+            relocate(År2,År)
+}
+
+if("År" %in% names(df2)){
+    df2<-df2%>%
+	mutate(År2=År)%>%
+            relocate(År2,År)
+}
+
+if("Vecka" %in% names(df2) & (unique(df2$ID_variabel)=="ccov19Regsasong.csv")){
+    df2<-df2%>%
+        mutate(Vecka2=str_replace(Vecka,"^v ([0-9]+)","W\\1"))%>%
+                   relocate(Vecka2,Vecka)
+}
+
+if("Vecka" %in% names(df2) & (unique(df2$ID_variabel)=="ecov19sabosasong.csv")){
+    df2<-df2%>%
+        mutate(Vecka2=str_replace(Vecka,"^v ([0-9]+)","W\\1"))%>%
+        relocate(Vecka2,Vecka)
+}
+
+if("Vecka" %in% names(df2) & (unique(df2$ID_variabel)=="PCRtest.csv")){
+    df2<-df2%>%
+        mutate(Vecka2=str_replace(Vecka,"^V ([0-9]+)","W\\1"))%>%
+        relocate(Vecka2,Vecka)
+}
+
+if("Kön" %in% names(df2) & unique(df2$ID_variabel)=="ccov19kon.csv"){
+    df2<-df2%>%mutate(Kön2=ifelse(
+        Kön=="Kvinnor", 1, ifelse(
+            Kön=="Män",2,ifelse(
+                Kön=="Uppgift saknas",3,99))))%>%
+        relocate(Kön2,Kön)
+}
+
+if("Kön" %in% names(df2) & unique(df2$ID_variabel)=="ycov19ivavkon.csv"){
+    df2<-df2%>%mutate(Kön2=ifelse(
+        Kön=="Kvinnor", 1, ifelse(
+            Kön=="Män",2,ifelse(
+                Kön=="Uppgift saknas",3,99))))%>%
+        relocate(Kön2,Kön)
+}
+
+if("Kön" %in% names(df2) & unique(df2$ID_variabel) %in% c("PCRtest.csv","PCRtestVAr.csv")){
+    df2<-df2%>%mutate(Kön2=ifelse(
+        Kön=="Kvinnor", 1, ifelse(
+        Kön=="Män",2,ifelse(
+        Kön=="Totalt",3,ifelse(
+	Kön=="Uppgift om kön saknas",4,99)))))%>%
+        relocate(Kön2,Kön)
+}
+
+
+
+
+
+if("Åldersgrupp" %in% names(df2) & (unique(df2$ID_variabel)=="dcov19ald.csv")){
+    df2<-df2%>%
+        mutate(Åldersgrupp2=ifelse(Åldersgrupp=="Uppgift saknas", "Saknas",Åldersgrupp))%>%
+                   relocate(Åldersgrupp2,Åldersgrupp)
+}
+
+if("Åldersgrupp" %in% names(df2) & (unique(df2$ID_variabel)=="ycov19ivavald.csv")){
+    df2<-df2%>%
+        mutate(Åldersgrupp2=ifelse(Åldersgrupp=="Uppgift saknas", "Saknas",str_replace(Åldersgrupp,"(^.*?) år$","\\1")))%>%
+                   relocate(Åldersgrupp2,Åldersgrupp)
+}
+if("Åldersgrupp" %in% names(df2) & (unique(df2$ID_variabel) %in% c("PCRtest.csv","PCRtestVAr.csv"))){
+    df2<-df2%>%
+        mutate(Åldersgrupp2=ifelse(
+            Åldersgrupp=="Alla åldrar", 1,ifelse(
+                Åldersgrupp=="0-19 år",2,ifelse(
+                    Åldersgrupp=="20-69 år",3,ifelse(
+                        Åldersgrupp=="70- år och äldre",4,ifelse(
+                            Åldersgrupp=="Uppgift om ålder saknas",5,99))))))%>%
+                relocate(Åldersgrupp2,Åldersgrupp)
+}
+
+
+df2<-df2%>%select(-ID_variabel)
+
+    
+    #ÅTERGÅR TILL DATAFIL och Lägger till rubrik
+    
+    df2<- rbind(c(tabellrubrik$second, rep(NA, ncol(df2) - 1)), names(df2), df2)
+
+    #Vi måste bearbeta "raden" med titlar så att titeln för CODES och titeln för variabeln blir desamma, det är så pxjob
+    #vet de ska slås ihop. Får att åstadkomma detta omvandlar vi tabellen till en matris och transponerar den.
+
+    df2<-t(as.matrix(df2))
+    df2<-as.data.frame(df2)%>%mutate(V2=str_replace(V2,"(.*)2","\\1"),V2)
+    df2<-as.data.frame(t(as.matrix(df2)))
+
+
+    
+    #Exporterar som vanligt
+    
+    write.table(as.data.frame(df2),file=
+                    paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers\\",fillista[i]), 
+                row.names = FALSE,col.names=FALSE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+    
+    write.table(full_control,
+                file=paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\kontrollfiler2\\",fillista_rensad[i],".csv"),
+                row.names = FALSE,col.names=FALSE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+} 
+
+stopImplicitCluster()
+
+#För körning i kommanmdotolken 
+#Vi skapar en lång kodrad med rätt kod för att köra pxjob i kommandotolken
+#och skapa px-filer från våra datset och våra kontrollfiler.
+
+cmd<-gsub("\\n","",paste0("cd /D C:\\Program Files (x86)\\PX-Edit 2019 ver 4.0 && ",paste0("Pxjob job=px path=\"G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\" in=\"\\In_headers\\",fillista,"\" 
+out=\"\\Out Veckokörningar\" meta=\"\\kontrollfiler2\\",fillista_rensad,".csv\" log=\"\\log\\log.txt\"", TIMEVAL_VECTOR, collapse=" && ")))
+
+#Vi sparar detta som en extern fil (denna kan behöva raderas om den inte uppdateras).
+
+fileConn<-file("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\Script\\output.txt")
+writeLines(c(cmd), fileConn)
+close(fileConn)
+
+# user  system elapsed 
+# 0.57    0.13  159.95 

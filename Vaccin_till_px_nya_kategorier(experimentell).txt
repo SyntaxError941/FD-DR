@@ -1,0 +1,531 @@
+library(dplyr)
+library(readxl)
+library(tidyr)
+library(lubridate)
+library(stringr)
+
+#Denna version syftar till att skapa de extra kategorier som Tiia efterfrågat.
+#Skapar ny version då jag vill ha fungerande referensmaterial vid eventuella fel.
+
+#LOGIKEN BÖR DUBBELKOLLAS!
+#Tidigare versionen hade felkodade värden för värdena med "minst XXX vaccinerade".
+#Kodade en sista-minuten-fix för detta som filterar ut dessa till ett separat dataset,
+#bearbetar dem separat och sedan sätter ihop dem med huvuddatasetet.
+
+#Importerar från excelblad, fliken för rådatan för HPV-vaccinationer
+
+offstat_utkast_01 <- read_excel("G:/Projekt/Vaccinationsregister/Magnus H/sme_riket_202212_v02_dosnummer-modell-08_v02.xlsx", 
+    sheet = "hpv_data", col_types = c("numeric", 
+        "text", "text", "text", "text", "text", 
+        "numeric", "text", "numeric", "numeric"))
+
+#Bearbetningen nedan tillåter oss hämta ut "population date" ur configuration-fliken.
+
+datum <- read_excel("G:/Projekt/Vaccinationsregister/Magnus H/offstat_utkast_01.xlsx", 
+    sheet = "configuration")
+
+datum<-as.data.frame(t(as.matrix(datum)))
+
+names(datum)<-datum[1,]
+
+datum<-datum$population_date[2]
+
+#Delar upp i antal folkbokförda och antal vaccinerade
+#I rådatan är dessa stackade/staplade på varandra, där folkbokförda har missing på antal vaccinerade och vice versa.
+
+
+antal_tot<-offstat_utkast_01%>%
+	filter(!is.na(nof_persons))%>%
+	select(birth_year, gender, county_name, municipality_name,nof_persons)
+antal_vacc<-offstat_utkast_01%>%
+	filter(!is.na(nof_patient))%>%
+	select(-nof_persons)
+
+#Joinar så vi får antal vaccinerade och antal folkbokförda på samma rad
+
+df<-antal_vacc%>%
+	inner_join(antal_tot,by=c("birth_year", "gender", "county_name", "municipality_name"))
+
+#Skapar totaler för regioner, kön och år
+
+dfsum<-df%>%group_by(gender,birth_year,county_name,nof_dose)%>%
+	mutate(	nof_patient=sum(nof_patient), 
+		nof_persons=sum(nof_persons),
+		municipality_name=county_name,
+		municipality_code=county_code)%>%
+		unique()
+
+#Skapar totaler nationellt per kön och år
+
+dfsumnat<-df%>%group_by(gender,birth_year,nof_dose)%>%
+	mutate(	nof_patient=sum(nof_patient), 
+		nof_persons=sum(nof_persons),
+		county_name="Riket",
+		county_code="00",
+		municipality_name="Riket",
+		municipality_code="00")%>%
+		unique()
+
+#Stackar (union) totaler med resterande data
+
+df_all<-rbind(df,dfsum,dfsumnat)
+
+#Vi slår ihop länsnamn med sina respektive länskoder (En av anledningarna att vi får arbeta med 
+#rådatan istället för de färdiga flikarna. 
+#Vi räknar även ut årtalet ifrån datum-variabeln (som vi läste in från configuration-fliken)
+
+
+df_all<-df_all%>%
+	mutate(andel=(nof_patient/nof_persons)*100)%>%
+	mutate(county_name=municipality_name,
+		county_code=municipality_code)%>%
+	arrange(as.numeric(county_code))%>%
+	mutate(Region=paste0(county_code, " ",county_name))%>%	
+	mutate(År=year(as.Date(datum)))%>%
+	mutate(
+	gender=ifelse(gender=="F", "flickor", ifelse(gender=="M", "pojkar", "99")),		
+				diseases=ifelse(diseases=="Humant papillomvirus", "HPV", diseases))
+
+#VIKTIGT! detta utdrag (dvs till_alder_per_vaccin) läggs till i nästa tabell, så vi slipper göra samma bearbetning en gång till 
+
+till_alder_per_vaccin<-df_all%>%
+	filter(År-birth_year==12 & nof_dose=="2")%>%
+	select(-municipality_name,-municipality_code,-nof_patient,-nof_persons,-county_name,-county_code)
+
+hpv_minst_1dos<-df_all%>%
+	filter(År-birth_year==12 & as.numeric(nof_dose)>=1)%>%
+	select(-municipality_name,-municipality_code,-county_name,-county_code)
+
+hpv_minst_1dos_alla<-df_all%>%
+	filter(as.numeric(nof_dose)>=1)%>%
+	select(-municipality_name,-municipality_code,-county_name,-county_code)%>%
+	mutate(nof_dose="minst 1 dos")%>%
+	group_by(Region,gender,birth_year)%>%
+	mutate(
+		nof_patient=sum(nof_patient),
+		nof_persons=sum(nof_persons))%>%
+	mutate(andel=nof_patient/nof_persons)%>%
+	unique()%>%
+	ungroup()%>%
+	filter(År-birth_year>=11 & År -birth_year<=17)%>%
+	mutate(
+		Vaccin=paste0(diseases," ",gender,", ",nof_dose),
+		andel=100*andel)
+	
+
+
+df_all<-df_all%>%
+	filter(nof_dose>=2)%>%
+	mutate(nof_dose=as.character(nof_dose))%>%
+	mutate(nof_dose= paste0(nof_dose," doser"))%>%
+	mutate(Vaccin=paste0(diseases," ",gender,", ",nof_dose))%>%
+	filter(År-birth_year>=11 & År -birth_year<=17)
+
+df_all<-df_all%>%
+	bind_rows(hpv_minst_1dos_alla)
+
+
+df_all<-df_all%>%
+	select(-municipality_name,-municipality_code,-nof_patient,-nof_persons,-county_code, -county_name, -gender, -nof_dose,-diseases)%>%
+	rename(Födelseår=birth_year,
+		value=andel)%>%
+		select(-value, everything())%>%
+		mutate(value=ifelse(
+			(Vaccin=="HPV pojkar, minst 1 dos"|Vaccin=="HPV pojkar, 2 doser") & Födelseår<2009,NA,value))
+
+
+write.table(as.data.frame(df_all),file="G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_vaccin\\vacHPV.csv", 
+                row.names = FALSE,col.names=TRUE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+
+#-----------------
+
+#Nu kommer vi skapa rådatan för barnvaccinationer.
+
+#För att undvika repetitiv kod kommer vi göra en lista på de filar som ska
+#importeras, och iterera över dem med en for-loop.  	
+#Vissa flikspecifika kommandon kommer anges med hjälp av
+#if-statemetns längre ner. 	 
+
+vacc_sheets<-c("pne_data","mpr_data","rot_data", "hex_data")
+
+vacc_list<-list()
+
+for(i in seq_along(vacc_sheets)){
+
+#Importerar från excelblad
+
+offstat_utkast_01 <- read_excel("G:/Projekt/Vaccinationsregister/Magnus H/offstat_utkast_01.xlsx", 
+    sheet = vacc_sheets[i], col_types = c("numeric", 
+        "text", "text", "text", "text", "text", 
+        "numeric", "text", "numeric", "numeric"))
+
+datum <- read_excel("G:/Projekt/Vaccinationsregister/Magnus H/offstat_utkast_01.xlsx", 
+    sheet = "configuration")
+
+
+datum<-as.data.frame(t(as.matrix(datum)))
+
+names(datum)<-datum[1,]
+
+
+datum<-datum$population_date[2]
+
+#Delar upp i antal folkbokförda och antal vaccinerade
+
+antal_tot<-offstat_utkast_01%>%
+	filter(!is.na(nof_persons))%>%
+	select(birth_year, gender, county_name, municipality_name,nof_persons)%>%
+	group_by(municipality_name, birth_year)%>%
+	mutate(nof_persons=sum(nof_persons))%>%
+	select(-gender)%>%
+	ungroup()%>%
+	unique()
+antal_vacc<-offstat_utkast_01%>%
+	filter(!is.na(nof_patient))
+
+#Hex-data kan syfta på ett flertal olika vaccin,
+#men Peter har i sin filtrering vald att fokusera på difteri. Efterliknar detta. 
+
+if(vacc_sheets[i]=="hex_data"){antal_vacc<-antal_vacc%>%
+	filter(diseases=="Difteri")}
+
+antal_vacc<-antal_vacc%>%
+	select(-nof_persons)%>%
+	group_by(municipality_name, birth_year,nof_dose)%>%
+	mutate(nof_patient=sum(nof_patient))%>%
+	select(-gender)%>%
+	ungroup()%>%
+	unique()
+
+#Joinar så vi får antal vaccinerade och antal folkbokförda på samma rad
+
+df<-antal_vacc%>%inner_join(antal_tot,by=c("birth_year", "county_name", "municipality_name"))
+
+dfsum<-df%>%group_by(birth_year,county_name,nof_dose)%>%
+	mutate(	nof_patient=sum(nof_patient), 
+		nof_persons=sum(nof_persons),
+		municipality_name=county_name,
+		municipality_code=county_code)%>%
+		unique()
+
+#Skapar totaler nationellt per kön och år
+
+dfsumnat<-df%>%group_by(birth_year,nof_dose)%>%
+	mutate(	nof_patient=sum(nof_patient), 
+		nof_persons=sum(nof_persons),
+		county_name="Riket",
+		county_code="00",
+		municipality_name="Riket",
+		municipality_code="00")%>%
+		unique()
+
+#Stackar (union) totaler med resterande data
+
+df_all<-rbind(df,dfsum,dfsumnat)
+
+#Genomför samma bearbetningar som tidigare. Räknar ut andelar, slår ihop
+#länsnamn/länsnummer osv
+
+
+df_all<-df_all%>%
+	mutate(andel=(nof_patient/nof_persons)*100)%>%
+	mutate(county_name=municipality_name,
+		county_code=municipality_code)%>%
+	arrange(as.numeric(county_code))%>%
+	mutate(Region=paste0(county_code, " ",county_name))%>%	
+	mutate(År=year(as.Date(datum)),
+		gender="")
+
+#Flikspecifika funktioner, säger vad exakt i de olika flikarna vi vill behålla.
+
+if(vacc_sheets[i]=="pne_data"){
+df_all<-df_all%>%
+	filter((nof_dose>=1|nof_dose==3) & (År-birth_year)==2)} 
+
+if(vacc_sheets[i]=="mpr_data"){
+df_all<-df_all%>%
+	filter((nof_dose==1 & (År-birth_year)==2)|(nof_dose==2 & År-birth_year==9))}
+
+if(vacc_sheets[i]=="rot_data"){
+    df_all<-df_all%>%
+	filter(nof_dose==2 & (År-birth_year)==1|nof_dose>=1 & (År-birth_year)==1)}
+
+if(vacc_sheets[i]=="hpv_data"){
+    df_all<-df_all%>%
+	filter(nof_dose==2 & (År-birth_year)==12)}
+
+if(vacc_sheets[i]=="hex_data"){
+    df_all<-df_all%>%filter(
+	((nof_dose<=3) & (År-birth_year)==2 & diseases=="Difteri")|
+        ((nof_dose==4) & (År-birth_year)==6 & diseases=="Difteri")|
+        ((nof_dose==5) & (År-birth_year)==16 & diseases=="Difteri"))}
+
+
+df_all<-df_all%>%
+	select(-municipality_name,-municipality_code,-county_name,-county_code)
+
+#Vi lägger till den skapade dataframen för varje iteration av for-loopen i en lista
+#med ordningsnummer för varje element motsvarande ordningsnumret för körningen.
+
+vacc_list[[i]]<-df_all
+}
+
+#Som sista element i listan lägger vi till körningen vi gjorde för HPV-vaccin i början. 
+
+vacc_list[[length(vacc_list)+1]]<-till_alder_per_vaccin
+
+#Vi stackar elementen från får lista och skapar en gemensam data frame. 
+
+df_all_tot<-bind_rows(vacc_list)
+
+#Vi skapar nu ett dataset för alla med "minst" ett visst antal doser, 
+#nämrare bestämt de som har minst en dos av vaccinen mot rotavirus, pneumokocker, 
+#HPV eller difteri (hexavalenta vaccinet)
+
+dataset_minst<-df_all_tot%>%
+	filter(diseases=="Rotavirus" & nof_dose>=1 & (År-birth_year)==1|
+		diseases=="Difteri" & nof_dose>=1 & (År-birth_year)==2|
+		diseases=="Pneumokock" & nof_dose>=1 & (År-birth_year)==2)
+
+dataset_minst<-dataset_minst%>%
+	bind_rows(hpv_minst_1dos)%>%
+	group_by(diseases,Region)%>%
+	mutate(
+		nof_patient=sum(nof_patient),
+		nof_persons=sum(nof_persons))%>%
+	mutate(andel=nof_patient/nof_persons)%>%
+	mutate(nof_dose=1)%>%
+	select(-nof_persons,-nof_patient)%>%
+	unique()%>%
+	ungroup()%>%
+	mutate(nof_dose=as.character(nof_dose))%>%
+    	mutate(diseases=ifelse(
+        	diseases=="Pneumokock", "Pneumokocker", ifelse(
+            	diseases=="Mässling, Påssjuka, Röda hund", "MPR", ifelse(
+                diseases=="Humant papillomvirus","HPV", ifelse(
+                diseases=="Difteri", paste0("DTP-polio-Hib-HepB, ", "minst ",nof_dose," dos"),diseases)))))%>%
+	mutate(åldersgrupp=paste0("(",as.character(År-birth_year),"-åringar)"))%>%
+	mutate(nof_dose=
+		ifelse(diseases!="DTP-polio-Hib-HepB, minst 1 dos",paste0("minst ", nof_dose," dos"),diseases))%>%
+	mutate(Vaccin=ifelse(
+		diseases=="HPV",paste0(diseases,", ",nof_dose,", ",gender," ", åldersgrupp) ,ifelse(
+		diseases=="DTP-polio-Hib-HepB, minst 1 dos"|
+		diseases=="DTP-polio, dos 4"|
+		diseases=="dTp, dos 5",
+			paste0(diseases," ",åldersgrupp),paste0(
+				diseases,", ",nof_dose," ",åldersgrupp))))%>%
+	mutate(Vaccin=ifelse(Vaccin=="Rotavirus, 1 doser (1-åringar)","Rotavirus, 1 dos (1-åringar)",Vaccin))%>%
+	select(-diseases,-gender,-åldersgrupp,-nof_dose,-birth_year)%>%
+	mutate(Indikator="Andel")%>%
+	rename(value=andel)%>%
+	select(-value, everything())%>%
+	mutate(value=100*value)
+
+
+#Vi lagrar nu information om sjukdom, dosnummer och i förekommande mån ålder och kön i diseases-variabeln.
+#Det är bara denna som kommer att finnas kvar sedan i PX-filen. 
+
+df_all_tot<-df_all_tot%>%
+	filter(!(diseases=="Difteri" & nof_dose<3))%>%
+	filter(!(diseases=="Rotavirus" & nof_dose==1))%>%
+	filter(!(diseases=="Pneumokock" & nof_dose<3))%>%
+	filter(!(diseases=="HPV" & nof_dose<2))
+
+df_all_tot<-df_all_tot<-df_all_tot%>%
+	mutate(nof_dose=as.character(nof_dose))%>%
+    	mutate(diseases=ifelse(
+        	diseases=="Pneumokock", "Pneumokocker", ifelse(
+            	diseases=="Mässling, Påssjuka, Röda hund", "MPR", ifelse(
+                diseases=="Humant papillomvirus","HPV", ifelse(
+                diseases=="Difteri" & nof_dose==3, paste0("DTP-polio-Hib-HepB, ",nof_dose," doser"),ifelse(
+                diseases=="Difteri" & nof_dose==4, paste0("DTP-polio, dos ",nof_dose), ifelse(
+                diseases=="Difteri" & nof_dose==5,paste0("dTp, dos ",nof_dose),diseases)))))))%>%
+	mutate(nof_dose=ifelse(
+		diseases=="Rotavirus",paste0(nof_dose," doser"),ifelse(
+		diseases=="Pneumokocker",paste0(nof_dose," doser"),ifelse(
+		diseases=="HPV", paste0(nof_dose," doser"),ifelse(
+		diseases=="MPR", paste0("dos ",nof_dose),nof_dose)))))%>%
+	mutate(åldersgrupp=paste0("(",as.character(År-birth_year),"-åringar)"))%>%
+	mutate(Vaccin=ifelse(
+		diseases=="HPV",paste0(diseases,", ",nof_dose,", ",gender," ", åldersgrupp) ,ifelse(
+		diseases=="DTP-polio-Hib-HepB, 3 doser"|
+		diseases=="DTP-polio, dos 4"|
+		diseases=="dTp, dos 5",
+			paste0(diseases," ",åldersgrupp),paste0(
+				diseases,", ",nof_dose," ",åldersgrupp))))%>%
+	mutate(Vaccin=ifelse(Vaccin=="Rotavirus, 1 doser (1-åringar)","Rotavirus, 1 dos (1-åringar)",Vaccin))%>%
+	select(-diseases,-gender,-åldersgrupp,-nof_dose,-birth_year,-nof_patient,-nof_persons)%>%
+	mutate(Indikator="Andel")%>%
+	rename(value=andel)%>%
+	select(-value, everything())
+
+df_all_tot<-df_all_tot%>%
+	bind_rows(dataset_minst)
+
+#Vi exporterar till csv som samkörningsscriptet kan läsa in
+
+write.table(as.data.frame(df_all_tot),file="G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_vaccin\\vacBarn.csv", 
+                row.names = FALSE,col.names=TRUE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+
+
+#-------------------------------
+#-------------------------------
+
+
+#HÄR BÖRJAR SAMKÖRNINGSSCRIPTET
+
+
+# Nedanstående ska förhoppningsvis installera saknade paket automatiskt.
+if(length(c("dplyr", "readr", "tidyr")[c("dplyr", "readr", "tidyr") %in% installed.packages()[,"Package"]])<3){install.packages("dplyr", "readr", "tidyr")}
+
+#install.packages("dplyr","readr","tidyr")
+library(dplyr)
+library(readr)
+library(tidyr)
+
+
+#Skapar fillista dataset
+# Vi läster först in alla datset i in-mappen till "fillista", och från den listan namnet på alla relaterade
+# rubriker, ini-filer, headers-filer och pivoteringsviller till "fillista_rensad". 
+
+fillista<-list.files("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_vaccin")
+fillista_rensad<-gsub("_[0-9]{8}.csv","",fillista)
+fillista_rensad<-gsub(".csv","",fillista_rensad)
+
+#Skapar en vektor för våra TIMEVAL-variabler, som kommer uppdateras
+#för varje steg i loopen. 
+
+TIMEVAL_VECTOR<-c()
+
+#Vi startar vår for-loop:
+
+for(i in seq_along(fillista)){
+    
+#Läser in datafiler och kontrollfiler
+
+df2 <- read_delim(paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers_vaccin\\",fillista[i]), 
+                      delim = ";", escape_double = FALSE, locale = locale(encoding = "windows-1252"), 
+                      trim_ws = TRUE)
+    
+    full_control <- read_delim(paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob/kontrollfiler vaccin\\",fillista_rensad[i],".csv"), 
+                               delim = ";", escape_double = FALSE, col_names = FALSE, 
+                               locale = locale(encoding = "windows-1252"), 
+                               trim_ws = TRUE)
+
+#Döper om variabelnamnen här istället för grovstädningsscriptet så slipper vi störa pivoteringsordningen.....
+
+if("kön" %in% names(df2)){df2<-df2%>%rename(Kön=kön)}
+if("region" %in% names(df2)){df2<-df2%>%rename(Region=region)}
+if("kod_Region" %in% names(df2)){df2<-df2%>%rename(Region=kod_Region)}
+if("kod_region" %in% names(df2)){df2<-df2%>%rename(Region=kod_region)}
+if("veckonummer" %in% names(df2)){df2<-df2%>%rename(Vecka=veckonummer)}
+if("ålder" %in% names(df2)){df2<-df2%>%rename(Åldersgrupp=ålder)}
+if("säsong" %in% names(df2)){df2<-df2%>%rename(År=säsong)}
+
+names(full_control)<-c("first","second","third", "fourth", "fifth", "sixth","seventh", "eighth", "ninth" )
+
+#Noterar tidsvariabel
+    
+tidsvariabel<-full_control%>%filter(first=="variablename")%>%select(third)
+tidsvariabel<-tidsvariabel$third
+tidsvariabel<-df2%>%pull(tidsvariabel)
+tidsvariabel<-tidsvariabel[!is.na(tidsvariabel)]
+
+#Lägger till obligatoriska fält. 
+
+#Lägger till REFPERIOD i KONTROLLFILEN med värden från datafil
+    
+full_control<-full_control%>%
+    mutate(second=ifelse(first=="LAST-UPDATED", as.character(format(Sys.time(),"%Y%m%d %H:%M")),ifelse(first=="REFPERIOD",paste0(min(tidsvariabel)," - ", max(tidsvariabel)),second)))
+    
+    TIMEVAL<-ifelse(sum(full_control$first=="TIMEVAL" & !is.na(full_control$third))>0," !T","")
+    TIMEVAL_VECTOR<-c(TIMEVAL_VECTOR,TIMEVAL)
+    
+#Bearbetar datafilen
+
+if("Dag" %in% names(df2)){df2$Dag<-as.character(df2$Dag)}
+
+if("Datum" %in% names(df2)){df2$Datum<-as.character(df2$Datum)}
+    
+    
+    #Läser in rubrik och pivoteringskolumn från kontrollfil
+    
+    tabellrubrik<-full_control%>%filter(first=="TITLE")%>%select(second)
+    
+    stub<-full_control%>%filter(first=="STUB")%>%select(second)
+    stub<-as.matrix(stub)[,]
+    
+    headings<-full_control%>%filter(first=="HEADING")%>%select(second)
+    headings<-as.matrix(headings)[,]
+    
+    pivot_rad_kolumn<-trimws(paste0(stub,",",headings))
+    pivot_rad_kolumn<-strsplit(pivot_rad_kolumn,",")[[1]]
+    Indikatorsrubriker<-names(df2)[!names(df2) %in% pivot_rad_kolumn]
+ 
+if(length(names(df2))>3 & !"Indikator" %in% names(df2) & !"value" %in% names(df2)){
+    df2<-pivot_longer(df2,cols=all_of(Indikatorsrubriker),names_to="Indikator")}
+
+if("value" %in% names(df2)){
+df2<-df2%>%select(-value,everything())}
+
+#Nu lägger vi till våra CODES-värden. Detta villkorar vi med namnen på tabellen, eftersom samma variabel kan ha olika codes i olika dataset.
+
+df2<-df2%>%mutate(ID_variabel=fillista[1])
+
+
+if("Region" %in% names(df2) & unique(df2$ID_variabel) %in% c("vacHPV.csv")){df2<-df2%>%mutate(Region2=str_replace(Region,"^([0-9]+).*$","\\1"))%>%
+    relocate(Region2, Region)}
+
+if("Vaccin" %in% names(df2) & unique(df2$ID_variabel) %in% c("vacHPV.csv")){df2<-df2%>%mutate(Vaccin2=ifelse(
+		Vaccin=="HPV flickor, minst 1 dos", "1",ifelse(
+		Vaccin=="HPV flickor, minst 2 doser","11",ifelse(
+		Vaccin=="HPV pojkar, minst 1 dos", "2", ifelse(
+		Vaccin=="HPV pojkar, minst 2 doser","22","99")))))%>%
+	relocate(Vaccin2, Vaccin)}
+
+if("År" %in% names(df2)){df2<-df2%>%
+	mutate(År2=År)%>%
+	relocate(År2, År)}
+
+if("Födelseår" %in% names(df2)){df2<-df2%>%
+	mutate(Födelseår2=Födelseår)%>%
+	relocate(Födelseår2, Födelseår)}
+
+df2<-df2%>%select(-ID_variabel)
+
+
+
+
+    df2<- rbind(c(tabellrubrik$second, rep(NA, ncol(df2) - 1)), names(df2), df2)
+
+    df2<-t(as.matrix(df2))
+    df2<-as.data.frame(df2)%>%mutate(V2=str_replace(V2,"(.*)2","\\1"),V2)
+    df2<-as.data.frame(t(as.matrix(df2)))
+
+
+    
+    #Exporterar som vanligt
+    
+    write.table(as.data.frame(df2),file=
+                    paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\In_headers\\",fillista[i]), 
+                row.names = FALSE,col.names=FALSE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+    
+    write.table(full_control,
+                file=paste0("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\kontrollfiler2\\",fillista_rensad[i],".csv"),
+                row.names = FALSE,col.names=FALSE, quote = FALSE, sep = ";", fileEncoding = "windows-1252", na="")
+}
+
+
+
+#För körning i kommanmdotolken 
+#Vi skapar en lång kodrad med rätt kod för att köra pxjob i kommandotolken
+#och skapa px-filer från våra datset och våra kontrollfiler.
+
+cmd<-gsub("\\n","",paste0("cd /D C:\\Program Files (x86)\\PX-Edit 2019 ver 4.0 && ",paste0("Pxjob job=px path=\"G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\" in=\"\\In_headers\\",fillista,"\" 
+out=\"\\Out vacc\" meta=\"\\kontrollfiler2\\",fillista_rensad,".csv\" log=\"\\log\\log.txt\"", TIMEVAL_VECTOR, collapse=" && ")))
+
+#Vi sparar detta som en extern fil (denna kan behöva raderas om den inte uppdateras).
+
+fileConn<-file("G:\\Data\\Folkhälsodata\\_3b px-filer (arbetsmaterial2023)\\Filer för Pxjob\\Script\\output.txt")
+writeLines(c(cmd), fileConn)
+close(fileConn)
